@@ -17,13 +17,12 @@
 
 from typing import TYPE_CHECKING, Optional
 
-from ...data import PairwiseDataCollatorWithPadding, get_dataset, get_template_and_fix_tokenizer
+from ...data import LengthValueDataCollator, get_dataset, get_template_and_fix_tokenizer
 from ...extras.ploting import plot_loss
 from ...model import load_model, load_tokenizer
-from ..callbacks import fix_valuehead_checkpoint
 from ..trainer_utils import create_modelcard_and_push
-from .metric import ComputeAccuracy
-from .trainer import PairwiseTrainer
+from .metric import ComputeLengthMetrics
+from .trainer import LengthValueTrainer
 
 
 if TYPE_CHECKING:
@@ -32,7 +31,7 @@ if TYPE_CHECKING:
     from ...hparams import DataArguments, FinetuningArguments, ModelArguments
 
 
-def run_rm(
+def run_lvm(
     model_args: "ModelArguments",
     data_args: "DataArguments",
     training_args: "Seq2SeqTrainingArguments",
@@ -42,20 +41,20 @@ def run_rm(
     tokenizer_module = load_tokenizer(model_args)
     tokenizer = tokenizer_module["tokenizer"]
     template = get_template_and_fix_tokenizer(tokenizer, data_args)
-    dataset_module = get_dataset(template, model_args, data_args, training_args, stage="rm", **tokenizer_module)
+    dataset_module = get_dataset(template, model_args, data_args, training_args, stage="lvm", **tokenizer_module)
     model = load_model(tokenizer, model_args, finetuning_args, training_args.do_train, add_valuehead=True)
-    data_collator = PairwiseDataCollatorWithPadding(
-        template=template, model=model, pad_to_multiple_of=8, **tokenizer_module
+    data_collator = LengthValueDataCollator(
+        template=template, model=model, pad_to_multiple_of=8, compute_dtype=model_args.compute_dtype, **tokenizer_module
     )
 
     # Initialize our Trainer
-    trainer = PairwiseTrainer(
+    trainer = LengthValueTrainer(
         model=model,
         args=training_args,
         finetuning_args=finetuning_args,
         data_collator=data_collator,
         callbacks=callbacks,
-        compute_metrics=ComputeAccuracy(),
+        compute_metrics=ComputeLengthMetrics(),
         **dataset_module,
         **tokenizer_module,
     )
@@ -64,9 +63,6 @@ def run_rm(
     if training_args.do_train:
         train_result = trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
         trainer.save_model()
-        if training_args.should_save:
-            fix_valuehead_checkpoint(model, training_args.output_dir, training_args.save_safetensors)
-
         trainer.log_metrics("train", train_result.metrics)
         trainer.save_metrics("train", train_result.metrics)
         trainer.save_state()
@@ -74,10 +70,10 @@ def run_rm(
             keys = ["loss"]
             if isinstance(dataset_module.get("eval_dataset"), dict):
                 keys += sum(
-                    [[f"eval_{key}_loss", f"eval_{key}_accuracy"] for key in dataset_module["eval_dataset"].keys()], []
+                    [[f"eval_{key}_loss", f"eval_{key}_mae", f"eval_{key}_rmse"] for key in dataset_module["eval_dataset"].keys()], []
                 )
             else:
-                keys += ["eval_loss", "eval_accuracy"]
+                keys += ["eval_loss", "eval_mae", "eval_rmse"]
 
             plot_loss(training_args.output_dir, keys=keys)
 

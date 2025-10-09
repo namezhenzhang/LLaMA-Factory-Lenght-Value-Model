@@ -14,6 +14,7 @@
 
 from .collator import (
     KTODataCollatorWithPadding,
+    LengthValueDataCollator,
     MultiModalDataCollatorForSeq2Seq,
     PairwiseDataCollatorWithPadding,
     SFTDataCollatorWith4DAttentionMask,
@@ -28,6 +29,7 @@ __all__ = [
     "KTODataCollatorWithPadding",
     "MultiModalDataCollatorForSeq2Seq",
     "PairwiseDataCollatorWithPadding",
+    "LengthValueDataCollator",
     "Role",
     "SFTDataCollatorWith4DAttentionMask",
     "Template",

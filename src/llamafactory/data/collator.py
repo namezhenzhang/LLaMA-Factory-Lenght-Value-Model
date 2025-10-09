@@ -288,6 +288,44 @@ class PairwiseDataCollatorWithPadding(MultiModalDataCollatorForSeq2Seq):
 
 
 @dataclass
+class LengthValueDataCollator(MultiModalDataCollatorForSeq2Seq):
+    r"""Data collator for length value regression."""
+
+    compute_dtype: "torch.dtype" = torch.float32
+
+    def __call__(self, features: list[dict[str, Any]]) -> dict[str, "torch.Tensor"]:
+        value_labels = [feature.pop("value_labels") for feature in features]
+        value_masks = [feature.pop("value_mask") for feature in features]
+        batch = super().__call__(features)
+        seq_len = batch["input_ids"].size(1)
+        padded_values = []
+        padded_masks = []
+        for vals in value_labels:
+            tensor_vals = torch.tensor(vals, dtype=self.compute_dtype)
+            pad_len = seq_len - tensor_vals.size(0)
+            if pad_len < 0:
+                tensor_vals = tensor_vals[:seq_len]
+            elif pad_len > 0:
+                tensor_vals = F.pad(tensor_vals, (0, pad_len), value=0.0)
+
+            padded_values.append(tensor_vals)
+
+        for masks in value_masks:
+            tensor_mask = torch.tensor(masks, dtype=self.compute_dtype)
+            pad_len = seq_len - tensor_mask.size(0)
+            if pad_len < 0:
+                tensor_mask = tensor_mask[:seq_len]
+            elif pad_len > 0:
+                tensor_mask = F.pad(tensor_mask, (0, pad_len), value=0.0)
+
+            padded_masks.append(tensor_mask)
+
+        batch["value_labels"] = torch.stack(padded_values, dim=0)
+        batch["value_mask"] = torch.stack(padded_masks, dim=0)
+        return batch
+
+
+@dataclass
 class KTODataCollatorWithPadding(MultiModalDataCollatorForSeq2Seq):
     r"""Data collator for KTO data."""
 

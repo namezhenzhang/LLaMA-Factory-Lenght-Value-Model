@@ -9,6 +9,7 @@ Make sure to execute these commands in the `LLaMA-Factory` directory.
 - [Full-Parameter Fine-Tuning](#full-parameter-fine-tuning)
 - [Merging LoRA Adapters and Quantization](#merging-lora-adapters-and-quantization)
 - [Inferring LoRA Fine-Tuned Models](#inferring-lora-fine-tuned-models)
+- [Length Value Modeling](#length-value-modeling)
 - [Extras](#extras)
 
 Use `CUDA_VISIBLE_DEVICES` (GPU) or `ASCEND_RT_VISIBLE_DEVICES` (NPU) to choose computing devices.
@@ -91,6 +92,12 @@ It is useful for large dataset, use `tokenized_path` in config to load the prepr
 
 ```bash
 llamafactory-cli train examples/train_lora/llama3_preprocess.yaml
+```
+
+### Length Value Modeling
+
+```bash
+llamafactory-cli train examples/train_lvm/qwen3_lrm.yaml
 ```
 
 #### Evaluating on MMLU/CMMLU/C-Eval Benchmarks
