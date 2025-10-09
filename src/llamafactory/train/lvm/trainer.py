@@ -98,10 +98,10 @@ class LengthValueTrainer(Trainer):
     ):
         value_labels = inputs.pop("value_labels")
         value_mask = inputs.pop("value_mask")
+        # Cast labels and masks to float32 to avoid mixed-precision dtype mismatches in loss computation
+        value_labels = value_labels.float()
+        value_mask = value_mask.float()
         value_preds = self._forward_value(model, inputs)
-
-        value_labels = value_labels.to(value_preds.dtype)
-        value_mask = value_mask.to(value_preds.dtype)
 
         mse = F.mse_loss(value_preds.float(), value_labels, reduction="none")
         mask_sum = value_mask.sum().clamp_min(1.0)
@@ -133,8 +133,9 @@ class LengthValueTrainer(Trainer):
         loss = None
         combined_labels = None
         if has_labels and value_labels is not None and value_mask is not None:
-            value_labels = value_labels.to(value_preds.dtype)
-            value_mask = value_mask.to(value_preds.dtype)
+            # Cast labels and masks to float32 for consistent loss computation
+            value_labels = value_labels.float()
+            value_mask = value_mask.float()
             mse = F.mse_loss(value_preds.float(), value_labels, reduction="none")
             loss = (mse * value_mask).sum() / value_mask.sum().clamp_min(1.0)
             combined_labels = torch.stack((value_labels, value_mask), dim=-1)
