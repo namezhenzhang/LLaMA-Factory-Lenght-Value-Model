@@ -33,7 +33,15 @@ class ComputeLengthMetrics:
         if hasattr(self, "score_dict"):
             result = {k: float(np.mean(v)) for k, v in self.score_dict.items()}
 
-        self.score_dict = {"mae": [], "rmse": [], "seq_mae": [], "seq_rmse": []}
+        # Reset with the exact keys we append to
+        self.score_dict = {
+            "token_mean_mae": [],
+            "token_mean_rmse": [],
+            "token_mean_seq_mean_mae": [],
+            "token_mean_seq_mean_rmse": [],
+            "token_mean_relerr": [],
+            "token_mean_seq_mean_relerr": [],
+        }
         return result
 
     def __post_init__(self):
@@ -60,6 +68,15 @@ class ComputeLengthMetrics:
         mae = np.sum(abs_diff) / denom
         rmse = np.sqrt(np.sum(sq_diff) / denom)
 
+        # Relative error (exclude positions with label == 0 to avoid division by zero)
+        valid_rel_mask = (masks > 0).astype(np.bool_) & (values > 0)
+        if np.any(valid_rel_mask):
+            rel_err = np.zeros_like(values, dtype=np.float64)
+            rel_err[valid_rel_mask] = (np.abs(preds[valid_rel_mask] - values[valid_rel_mask]) / values[valid_rel_mask])
+            token_mean_relerr = float(np.mean(rel_err[valid_rel_mask]))
+        else:
+            token_mean_relerr = 0.0
+
         # per-sequence statistics (average over valid tokens of each sequence, then mean over samples)
         if preds.ndim == 1:
             seq_denoms = np.array([denom])
@@ -70,6 +87,26 @@ class ComputeLengthMetrics:
             seq_denoms = np.clip(masks.sum(axis=seq_axes), a_min=1.0, a_max=None)
             seq_mae_vals = np.sum(abs_diff, axis=seq_axes) / seq_denoms
             seq_rmse_vals = np.sqrt(np.sum(sq_diff, axis=seq_axes) / seq_denoms)
+            # per-sequence relative error: exclude zeros per sequence
+            if preds.ndim == 2:
+                bsz, seqlen = preds.shape
+                seq_rel_vals = []
+                for i in range(bsz):
+                    valid_i = (masks[i] > 0).astype(np.bool_) & (values[i] > 0)
+                    if np.any(valid_i):
+                        rel_i = np.abs(preds[i, valid_i] - values[i, valid_i]) / values[i, valid_i]
+                        seq_rel_vals.append(float(np.mean(rel_i)))
+                if len(seq_rel_vals) == 0:
+                    seq_relerr = 0.0
+                else:
+                    seq_relerr = float(np.mean(seq_rel_vals))
+            else:
+                # For higher dims, fall back to computing over the flattened valid positions
+                valid_rel = valid_rel_mask
+                if np.any(valid_rel):
+                    seq_relerr = float(np.mean((np.abs(preds[valid_rel] - values[valid_rel]) / values[valid_rel])))
+                else:
+                    seq_relerr = 0.0
         seq_mae = float(np.mean(seq_mae_vals))
         seq_rmse = float(np.mean(seq_rmse_vals))
 
@@ -77,6 +114,11 @@ class ComputeLengthMetrics:
         self.score_dict["token_mean_rmse"].append(rmse)
         self.score_dict["token_mean_seq_mean_mae"].append(seq_mae)
         self.score_dict["token_mean_seq_mean_rmse"].append(seq_rmse)
+        self.score_dict["token_mean_relerr"].append(token_mean_relerr)
+        # If preds.ndim == 1, seq_relerr equals token_mean_relerr
+        self.score_dict["token_mean_seq_mean_relerr"].append(
+            token_mean_relerr if preds.ndim == 1 else seq_relerr
+        )
 
         if compute_result:
             return self._dump()

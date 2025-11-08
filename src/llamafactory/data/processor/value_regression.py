@@ -23,7 +23,7 @@ class LengthValueDatasetProcessor(DatasetProcessor):
         images: list["ImageInput"],
         videos: list["VideoInput"],
         audios: list["AudioInput"],
-    ) -> tuple[list[int], list[float], list[float]]:
+    ) -> tuple[list[int], list[int], list[bool]]:
         messages = self.template.mm_plugin.process_messages(prompt + response, images, videos, audios, self.processor)
         prompt_ids, response_ids = self.template.encode_oneturn(self.tokenizer, messages, system, tools)
 
@@ -40,15 +40,14 @@ class LengthValueDatasetProcessor(DatasetProcessor):
         input_ids = prompt_ids + response_ids
         seq_len = len(input_ids)
         # compute length-to-go targets per token (including prompt final token)
-        targets: list[float] = []
-        masks: list[float] = []
+        targets: list[int] = []
+        masks: list[bool] = []
 
         valid_start = max(source_len - 1, 0)
         for idx in range(seq_len):
             remaining = seq_len - idx
-            targets.append(float(remaining))
-            masks.append(1.0 if idx >= valid_start else 0.0)
-
+            targets.append(int(remaining))
+            masks.append(True if idx >= valid_start and idx < seq_len - 1 else False) # ignore the last token <eos>
         return input_ids, targets, masks
 
     def preprocess_dataset(self, examples: dict[str, list[Any]]) -> dict[str, list[Any]]:

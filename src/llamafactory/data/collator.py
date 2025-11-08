@@ -301,24 +301,24 @@ class LengthValueDataCollator(MultiModalDataCollatorForSeq2Seq):
         padded_values = []
         padded_masks = []
         for vals in value_labels:
-            # Force float32 for labels to avoid mixed precision issues in downstream loss computation
-            tensor_vals = torch.tensor(vals, dtype=torch.float32)
+            tensor_vals = torch.tensor(vals, dtype=torch.int64)
             pad_len = seq_len - tensor_vals.size(0)
             if pad_len < 0:
                 tensor_vals = tensor_vals[:seq_len]
             elif pad_len > 0:
-                tensor_vals = F.pad(tensor_vals, (0, pad_len), value=0.0)
+                padding = torch.zeros(pad_len, dtype=tensor_vals.dtype)
+                tensor_vals = torch.cat((tensor_vals, padding), dim=0)
 
             padded_values.append(tensor_vals)
 
         for masks in value_masks:
-            # Force float32 for masks to avoid mixed precision issues in downstream loss computation
-            tensor_mask = torch.tensor(masks, dtype=torch.float32)
+            tensor_mask = torch.tensor(masks, dtype=torch.bool)
             pad_len = seq_len - tensor_mask.size(0)
             if pad_len < 0:
                 tensor_mask = tensor_mask[:seq_len]
             elif pad_len > 0:
-                tensor_mask = F.pad(tensor_mask, (0, pad_len), value=0.0)
+                padding = torch.zeros(pad_len, dtype=tensor_mask.dtype)
+                tensor_mask = torch.cat((tensor_mask, padding), dim=0)
 
             padded_masks.append(tensor_mask)
 

@@ -15,6 +15,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections import OrderedDict
+from types import MethodType
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -54,6 +56,12 @@ class LengthValueTrainer(Trainer):
 
         if processor is not None:
             self.add_callback(SaveProcessorCallback(processor))
+        
+        if finetuning_args.use_badam:
+            from badam import BAdamCallback, clip_grad_norm_old_version  # type: ignore
+
+            self.accelerator.clip_grad_norm_ = MethodType(clip_grad_norm_old_version, self.accelerator)
+            self.add_callback(BAdamCallback)
 
     @override
     def create_optimizer(self) -> "torch.optim.Optimizer":
@@ -92,6 +100,38 @@ class LengthValueTrainer(Trainer):
 
         return value_preds
 
+    def _apply_decay_factor(self, value_labels: torch.Tensor, value_mask: torch.Tensor) -> torch.Tensor:
+        r"""Apply decay factor to future token values.
+        
+        Args:
+            value_labels: Tensor of shape (batch_size, seq_len) containing the number of future tokens
+            value_mask: Tensor of shape (batch_size, seq_len) indicating valid positions
+            
+        Returns:
+            Modified value_labels with decay applied
+        """
+        if self.finetuning_args.lvm_decay_factor == 1.0:
+            return value_labels
+            
+        # Create decay weights: for each position, apply decay_factor^(n-1) where n is the distance
+        batch_size, seq_len = value_labels.shape
+        device = value_labels.device
+        
+        # Create position indices for each sequence
+        positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
+        
+        # Calculate decay weights: decay_factor^(n-1) where n is the distance from current token
+        # For value_labels[i, j], the distance is value_labels[i, j], so decay is decay_factor^(value_labels[i, j]-1)
+        decay_weights = torch.pow(self.finetuning_args.lvm_decay_factor, value_labels)
+        
+        # Apply decay weights to value_labels
+        decayed_labels = 1 - decay_weights
+        
+        # Only apply decay where mask is valid
+        decayed_labels = decayed_labels * value_mask
+        
+        return decayed_labels
+
     @override
     def compute_loss(
         self, model: "PreTrainedModel", inputs: dict[str, torch.Tensor], return_outputs: bool = False, **kwargs
@@ -99,17 +139,46 @@ class LengthValueTrainer(Trainer):
         value_labels = inputs.pop("value_labels")
         value_mask = inputs.pop("value_mask")
         # Cast labels and masks to float32 to avoid mixed-precision dtype mismatches in loss computation
-        value_labels = value_labels.float()
-        value_mask = value_mask.float()
+        value_labels = value_labels
+        value_mask = value_mask
         value_preds = self._forward_value(model, inputs)
 
-        mse = F.mse_loss(value_preds.float(), value_labels, reduction="none")
-        mask_sum = value_mask.sum().clamp_min(1.0)
-        loss = (mse * value_mask).sum() / mask_sum
+        # Apply decay factor to future token values
+        if self.finetuning_args.lvm_decay_factor != 1.0:
+            value_labels = self._apply_decay_factor(value_labels, value_mask)
 
+        # Prepare labels for loss (optionally in log-space)
+        if self.finetuning_args.lvm_use_log1p:
+            labels_for_loss = torch.log1p(value_labels.clamp_min(0.0))
+        else:
+            labels_for_loss = value_labels
+        
+        if self.finetuning_args.lvm_use_sigmoid:
+            value_preds = torch.sigmoid(value_preds)
+        else:
+            value_preds = value_preds
+        # Compute token-wise loss
+        if getattr(self.finetuning_args, "lvm_loss", "mse") == "smooth_l1":
+            per_token_loss = F.smooth_l1_loss(
+                value_preds, labels_for_loss, beta=self.finetuning_args.lvm_smooth_l1_beta, reduction="none"
+            )
+        else:
+            per_token_loss = torch.pow(value_preds - labels_for_loss, 2)/2
+
+        mask_sum = value_mask.sum().clamp_min(1.0)
+        loss = (per_token_loss * value_mask).sum() / mask_sum
+        # rank 0
+        # import os
+        # if int(os.getenv("LOCAL_RANK", "0")) == 0:
+        #     import pdb; pdb.set_trace()
         if return_outputs:
+            # For metrics, return predictions in original scale if trained in log-space
+            if self.finetuning_args.lvm_use_log1p:
+                preds_for_metric = torch.expm1(value_preds).clamp_min(0.0)
+            else:
+                preds_for_metric = value_preds
             combined_labels = torch.stack((value_labels.detach(), value_mask.detach()), dim=-1)
-            return loss, (value_preds.detach(), combined_labels)
+            return loss, (preds_for_metric.detach(), combined_labels)
 
         return loss
 
@@ -134,15 +203,39 @@ class LengthValueTrainer(Trainer):
         combined_labels = None
         if has_labels and value_labels is not None and value_mask is not None:
             # Cast labels and masks to float32 for consistent loss computation
-            value_labels = value_labels.float()
-            value_mask = value_mask.float()
-            mse = F.mse_loss(value_preds.float(), value_labels, reduction="none")
-            loss = (mse * value_mask).sum() / value_mask.sum().clamp_min(1.0)
+            value_labels = value_labels
+            value_mask = value_mask
+            
+            # Apply decay factor to future token values
+            if self.finetuning_args.lvm_decay_factor != 1.0:
+                value_labels = self._apply_decay_factor(value_labels, value_mask)
+            
+            if self.finetuning_args.lvm_use_log1p:
+                labels_for_loss = torch.log1p(value_labels.clamp_min(0.0))
+            else:
+                labels_for_loss = value_labels
+
+            if self.finetuning_args.lvm_use_sigmoid:
+                value_preds = torch.sigmoid(value_preds)
+            else:
+                value_preds = value_preds
+
+            if getattr(self.finetuning_args, "lvm_loss", "mse") == "smooth_l1":
+                per_token_loss = F.smooth_l1_loss(
+                    value_preds, labels_for_loss, beta=self.finetuning_args.lvm_smooth_l1_beta, reduction="none"
+                )
+            else:
+                per_token_loss = torch.pow(value_preds - labels_for_loss, 2)/2
+
+            loss = (per_token_loss * value_mask).sum() / value_mask.sum().clamp_min(1.0)
             combined_labels = torch.stack((value_labels, value_mask), dim=-1)
 
         if prediction_loss_only:
             return loss, None, None
 
+        # Return predictions in original scale for metrics/outputs
+        if self.finetuning_args.lvm_use_log1p:
+            value_preds = torch.expm1(value_preds).clamp_min(0.0)
         value_preds = value_preds.detach()
         if combined_labels is not None:
             combined_labels = combined_labels.detach()

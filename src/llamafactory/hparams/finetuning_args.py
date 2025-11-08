@@ -514,6 +514,39 @@ class FinetuningArguments(
         metadata={"help": "Whether or not to compute effective tokens per second."},
     )
 
+    # Length Value Model (LVM) specific options
+    lvm_loss: Literal["mse", "smooth_l1"] = field(
+        default="mse",
+        metadata={"help": "Loss function to optimize in LVM training (mse or smooth_l1)."},
+    )
+    lvm_use_log1p: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Apply log1p transform to length labels and train in log-space. "
+                "Predictions are exponentiated back (expm1 + clamp to >=0) for metrics."
+            )
+        },
+    )
+    lvm_use_sigmoid: bool = field(
+        default=False,
+        metadata={"help": "Apply sigmoid transform to length predictions."},
+    )
+    lvm_smooth_l1_beta: float = field(
+        default=1.0,
+        metadata={"help": "Beta parameter for SmoothL1 (Huber) loss in LVM training."},
+    )
+    lvm_decay_factor: float = field(
+        default=1.0,
+        metadata={
+            "help": (
+                "Decay factor for future token values in LVM training. "
+                "Future tokens are weighted as 1 * decay_factor^(n-1) where n is the distance from current token. "
+                "Set to 1.0 to disable decay (default behavior)."
+            )
+        },
+    )
+
     def __post_init__(self):
         def split_arg(arg):
             if isinstance(arg, str):
