@@ -271,8 +271,8 @@ class CustomPPOTrainer(PPOTrainer, Trainer):
 
             if self.is_local_process_zero() and (step + 1) % self.args.logging_steps == 0:
                 logs = dict(
-                    loss=round(loss_meter.avg, 4),
-                    reward=round(reward_meter.avg, 4),
+                    loss=loss_meter.avg,
+                    reward=reward_meter.avg,
                     learning_rate=stats["ppo/learning_rate"],
                     epoch=round(step / steps_in_epoch, 2),
                 )

@@ -62,6 +62,14 @@ class LengthValueTrainer(Trainer):
 
             self.accelerator.clip_grad_norm_ = MethodType(clip_grad_norm_old_version, self.accelerator)
             self.add_callback(BAdamCallback)
+        
+        # Diagnostics accumulators for gradient accumulation-safe logging
+        self._diag_ga_sum_main = 0.0
+        self._diag_ga_sum_lam0 = 0.0
+        self._diag_ga_sum_lam1 = 0.0
+        # self._diag_ga_sum_lam05 = 0.0
+        self._diag_ga_count = 0
+        self._diag_ga_step = 0
 
     @override
     def create_optimizer(self) -> "torch.optim.Optimizer":
@@ -132,55 +140,150 @@ class LengthValueTrainer(Trainer):
         
         return decayed_labels
 
+    def _compute_gae_advantage_return(self, y_hat: torch.Tensor, value_mask: torch.Tensor, reward: float, gamma: float, lam: float) -> torch.Tensor:
+        value_mask = value_mask.to(y_hat.dtype)
+        token_level_rewards = reward
+        nextvalues = 0
+        lastgaelam = 0
+        advantages_reversed = []
+        gen_len = y_hat.shape[-1]
+
+        for t in reversed(range(gen_len)):
+            delta = token_level_rewards + gamma * nextvalues - y_hat[:, t]
+            lastgaelam_ = delta + gamma * lam * lastgaelam
+
+            # skip values and TD-error on observation tokens
+            nextvalues = y_hat[:, t] * value_mask[:, t] + (1 - value_mask[:, t]) * nextvalues
+            lastgaelam = lastgaelam_ * value_mask[:, t] + (1 - value_mask[:, t]) * lastgaelam
+
+            advantages_reversed.append(lastgaelam)
+        advantages = torch.stack(advantages_reversed[::-1], dim=1)
+
+        returns = advantages + y_hat
+
+        return advantages, returns
+    def aggregate_loss(self, loss: torch.Tensor, value_mask: torch.Tensor, method: str = "token-mean") -> torch.Tensor:
+        if method == "token-mean":
+            value_mask = value_mask.to(loss.dtype)
+            total = (loss * value_mask).sum()
+            denom = value_mask.sum().clamp_min(torch.tensor(1.0, device=loss.device, dtype=loss.dtype))
+            return total / denom
+        elif method == "seq-mean-token-sum":
+            value_mask = value_mask.to(loss.dtype)
+            per_seq_sum = (loss * value_mask).sum(dim=1)
+            valid_seq_mask = (value_mask.sum(dim=1) > 0).to(loss.dtype)
+            denom = valid_seq_mask.sum().clamp_min(torch.tensor(1.0, device=loss.device, dtype=loss.dtype))
+            return (per_seq_sum * valid_seq_mask).sum() / denom
+        elif method == "seq-mean-token-mean":
+            value_mask_f = value_mask.to(loss.dtype)
+            per_seq_token_count = value_mask_f.sum(dim=1).clamp_min(torch.tensor(1.0, device=loss.device, dtype=loss.dtype))
+            per_seq_mean = (loss * value_mask_f).sum(dim=1) / per_seq_token_count
+            valid_seq_mask = (value_mask.sum(dim=1) > 0).to(loss.dtype)
+            denom = valid_seq_mask.sum().clamp_min(torch.tensor(1.0, device=loss.device, dtype=loss.dtype))
+            return (per_seq_mean * valid_seq_mask).sum() / denom
+        else:
+            raise ValueError(f"Invalid method: {method}")
+
     @override
     def compute_loss(
         self, model: "PreTrainedModel", inputs: dict[str, torch.Tensor], return_outputs: bool = False, **kwargs
     ):
-        value_labels = inputs.pop("value_labels")
-        value_mask = inputs.pop("value_mask")
-        # Cast labels and masks to float32 to avoid mixed-precision dtype mismatches in loss computation
-        value_labels = value_labels
-        value_mask = value_mask
-        value_preds = self._forward_value(model, inputs)
+        value_labels = inputs.pop("value_labels").to(torch.float64) # remaining number of tokens
+        value_mask = inputs.pop("value_mask").to(torch.float64) # mask of response tokens
 
-        # Apply decay factor to future token values
-        if self.finetuning_args.lvm_decay_factor != 1.0:
-            value_labels = self._apply_decay_factor(value_labels, value_mask)
+        value_preds = self._forward_value(model, inputs).to(torch.float64)
 
-        # Prepare labels for loss (optionally in log-space)
-        if self.finetuning_args.lvm_use_log1p:
-            labels_for_loss = torch.log1p(value_labels.clamp_min(0.0))
-        else:
-            labels_for_loss = value_labels
-        
-        if self.finetuning_args.lvm_use_sigmoid:
-            value_preds = torch.sigmoid(value_preds)
-        else:
-            value_preds = value_preds
-        # Compute token-wise loss
-        if getattr(self.finetuning_args, "lvm_loss", "mse") == "smooth_l1":
-            per_token_loss = F.smooth_l1_loss(
-                value_preds, labels_for_loss, beta=self.finetuning_args.lvm_smooth_l1_beta, reduction="none"
-            )
-        else:
-            per_token_loss = torch.pow(value_preds - labels_for_loss, 2)/2
+        gamma = self.finetuning_args.lvm_gamma
+        lam = self.finetuning_args.lvm_lam
+        delta = self.finetuning_args.lvm_huber_loss_delta
+        agg_method = self.finetuning_args.lvm_agg_method
+        reward = 1.0 - gamma
 
-        mask_sum = value_mask.sum().clamp_min(1.0)
-        loss = (per_token_loss * value_mask).sum() / mask_sum
-        # rank 0
-        # import os
-        # if int(os.getenv("LOCAL_RANK", "0")) == 0:
-        #     import pdb; pdb.set_trace()
+        y_hat = torch.sigmoid(value_preds)
+
+        with torch.no_grad():
+            advantages, returns = self._compute_gae_advantage_return(y_hat, value_mask, reward, gamma, lam)
+            # advantages = verl_F.masked_whiten(advantages, value_mask)
+
+        value_loss = torch.nn.functional.huber_loss(
+            y_hat, returns, reduction="none", delta=delta
+        )
+        # if self.accelerator.is_main_process:
+        #     import pdb
+        #     pdb.set_trace()
+    
+        # value_loss = 0.5 * (y_hat-returns) ** 2
+        value_loss = self.aggregate_loss(value_loss, value_mask, method = agg_method)
+
+        with torch.no_grad():
+            # Compute and report losses for lam=0 and lam=1 (diagnostics only)
+            _, returns_lam0 = self._compute_gae_advantage_return(y_hat, value_mask, reward, gamma, 0.0)
+            loss_lam0 = F.huber_loss(y_hat, returns_lam0, reduction="none", delta=delta)
+            # loss_lam0 = 0.5 * (y_hat-returns_lam0) ** 2
+            loss_lam0 = self.aggregate_loss(loss_lam0, value_mask, method = agg_method)
+
+            # _, returns_lam05 = self._compute_gae_advantage_return(y_hat, value_mask, reward, gamma, 0.5)
+            # loss_lam05 = F.huber_loss(y_hat, returns_lam05, reduction="none", delta=delta)
+            # # loss_lam05 = 0.5 * (y_hat-returns_lam05) ** 2
+            # loss_lam05 = self.aggregate_loss(loss_lam05, value_mask, method = agg_method)
+            
+            _, returns_lam1 = self._compute_gae_advantage_return(y_hat, value_mask, reward, gamma, 1.0)
+            loss_lam1 = F.huber_loss(y_hat, returns_lam1, reduction="none", delta=delta)
+            # loss_lam1 = 0.5 * (y_hat-returns_lam1) ** 2
+            loss_lam1 = self.aggregate_loss(loss_lam1, value_mask, method = agg_method)
+            
+            # Accumulate diagnostics across micro-steps (gradient accumulation)
+            ga_steps = max(1, getattr(self.args, "gradient_accumulation_steps", 1))
+            self._diag_ga_sum_main += float(value_loss.detach())
+            self._diag_ga_sum_lam0 += float(loss_lam0.detach())
+            self._diag_ga_sum_lam1 += float(loss_lam1.detach())
+            # self._diag_ga_sum_lam05 += float(loss_lam05.detach())
+            self._diag_ga_count += 1
+            self._diag_ga_step = (self._diag_ga_step + 1) % ga_steps
+            # Only log once per optimizer step and in sync with logging_steps
+            if self._diag_ga_step == 0 and self.state is not None and self.args is not None:
+                if self.args.logging_steps > 0 and (self.state.global_step % self.args.logging_steps == 0):
+                    # Reduce across processes (DDP) before computing averages
+                    device = value_loss.device
+                    sum_main = torch.tensor(self._diag_ga_sum_main, device=device, dtype=torch.float32)
+                    sum_l0 = torch.tensor(self._diag_ga_sum_lam0, device=device, dtype=torch.float32)
+                    sum_l1 = torch.tensor(self._diag_ga_sum_lam1, device=device, dtype=torch.float32)
+                    # sum_l05 = torch.tensor(self._diag_ga_sum_lam05, device=device, dtype=torch.float32)
+                    cnt = torch.tensor(self._diag_ga_count, device=device, dtype=torch.float32)
+                    if torch.distributed.is_available() and torch.distributed.is_initialized():
+                        torch.distributed.all_reduce(sum_main, op=torch.distributed.ReduceOp.SUM)
+                        torch.distributed.all_reduce(sum_l0, op=torch.distributed.ReduceOp.SUM)
+                        # torch.distributed.all_reduce(sum_l05, op=torch.distributed.ReduceOp.SUM)
+                        torch.distributed.all_reduce(sum_l1, op=torch.distributed.ReduceOp.SUM)
+                        torch.distributed.all_reduce(cnt, op=torch.distributed.ReduceOp.SUM)
+
+                    if self.accelerator.is_main_process:
+                        avg_main = (sum_main / cnt.clamp_min(1.0)).item()
+                        avg_l0 = (sum_l0 / cnt.clamp_min(1.0)).item()
+                        # avg_l05 = (sum_l05 / cnt.clamp_min(1.0)).item()
+                        avg_l1 = (sum_l1 / cnt.clamp_min(1.0)).item()
+                        # print(f"value_loss(lam={lam}): {avg_main} | value_loss_lam0: {avg_l0} | value_loss_lam1: {avg_l1}")
+                        self.log(
+                            {
+                                f"train/value_loss_lam{lam}": avg_main,
+                                "train/value_loss_lam0": avg_l0,
+                                # "train/value_loss_lam05": avg_l05,
+                                "train/value_loss_lam1": avg_l1,
+                            }
+                        )
+                # reset accumulators after optimizer step
+                self._diag_ga_sum_main = 0.0
+                self._diag_ga_sum_lam0 = 0.0
+                # self._diag_ga_sum_lam05 = 0.0
+                self._diag_ga_sum_lam1 = 0.0
+                self._diag_ga_count = 0
+
         if return_outputs:
-            # For metrics, return predictions in original scale if trained in log-space
-            if self.finetuning_args.lvm_use_log1p:
-                preds_for_metric = torch.expm1(value_preds).clamp_min(0.0)
-            else:
-                preds_for_metric = value_preds
+            preds_for_metric = value_preds
             combined_labels = torch.stack((value_labels.detach(), value_mask.detach()), dim=-1)
-            return loss, (preds_for_metric.detach(), combined_labels)
+            return value_loss, (preds_for_metric.detach(), combined_labels)
 
-        return loss
+        return value_loss
 
     @override
     def prediction_step(
@@ -190,6 +293,7 @@ class LengthValueTrainer(Trainer):
         prediction_loss_only: bool,
         ignore_keys: Optional[list[str]] = None,
     ):
+        return 0, None, None
         has_labels = "value_labels" in inputs and "value_mask" in inputs
         inputs = self._prepare_inputs(inputs)
 
@@ -201,41 +305,33 @@ class LengthValueTrainer(Trainer):
 
         loss = None
         combined_labels = None
+
         if has_labels and value_labels is not None and value_mask is not None:
-            # Cast labels and masks to float32 for consistent loss computation
-            value_labels = value_labels
-            value_mask = value_mask
-            
-            # Apply decay factor to future token values
-            if self.finetuning_args.lvm_decay_factor != 1.0:
-                value_labels = self._apply_decay_factor(value_labels, value_mask)
-            
-            if self.finetuning_args.lvm_use_log1p:
-                labels_for_loss = torch.log1p(value_labels.clamp_min(0.0))
-            else:
-                labels_for_loss = value_labels
 
-            if self.finetuning_args.lvm_use_sigmoid:
-                value_preds = torch.sigmoid(value_preds)
-            else:
-                value_preds = value_preds
+            gamma = self.finetuning_args.lvm_gamma
+            assert 0.0 < gamma <= 1.0, "gamma must be (0.0, 1.0]"
+            lam = self.finetuning_args.lvm_lam
+            assert 0.0 <= lam <= 1.0, "lam must be [0.0, 1.0]"
 
-            if getattr(self.finetuning_args, "lvm_loss", "mse") == "smooth_l1":
-                per_token_loss = F.smooth_l1_loss(
-                    value_preds, labels_for_loss, beta=self.finetuning_args.lvm_smooth_l1_beta, reduction="none"
-                )
-            else:
-                per_token_loss = torch.pow(value_preds - labels_for_loss, 2)/2
+            reward = 1 - gamma
 
-            loss = (per_token_loss * value_mask).sum() / value_mask.sum().clamp_min(1.0)
+            y_hat = torch.sigmoid(value_preds)
+
+            with torch.no_grad():
+                advantages, returns = self._compute_gae_advantage_return(y_hat, value_mask, reward, gamma, lam)
+                # advantages = verl_F.masked_whiten(advantages, value_mask)
+
+            value_loss = torch.nn.functional.huber_loss(
+                y_hat, returns, reduction="none", delta=0.5
+            )
+            # value_loss = 0.5 * (y_hat-returns) ** 2
+            value_loss = (value_loss * value_mask).sum() / (value_mask.shape[1]*value_mask.shape[0])
+
             combined_labels = torch.stack((value_labels, value_mask), dim=-1)
 
         if prediction_loss_only:
             return loss, None, None
 
-        # Return predictions in original scale for metrics/outputs
-        if self.finetuning_args.lvm_use_log1p:
-            value_preds = torch.expm1(value_preds).clamp_min(0.0)
         value_preds = value_preds.detach()
         if combined_labels is not None:
             combined_labels = combined_labels.detach()

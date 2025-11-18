@@ -298,7 +298,7 @@ class LogCallback(TrainerCallback):
 
         logs = {k: v for k, v in logs.items() if v is not None}
         if self.webui_mode and all(key in logs for key in ("loss", "lr", "epoch")):
-            log_str = f"'loss': {logs['loss']:.4f}, 'learning_rate': {logs['lr']:2.4e}, 'epoch': {logs['epoch']:.2f}"
+            log_str = f"'loss': {logs['loss']:.6f}, 'learning_rate': {logs['lr']:2.4e}, 'epoch': {logs['epoch']:.2f}"
             for extra_key in ("reward", "accuracy", "throughput"):
                 if logs.get(extra_key):
                     log_str += f", '{extra_key}': {logs[extra_key]:.2f}"
@@ -383,3 +383,35 @@ class ReporterCallback(TrainerCallback):
                     "generating_args": self.generating_args.to_dict(),
                 }
             )
+
+    # @override
+    # def on_log(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):
+    #     if not state.is_world_process_zero:
+    #         return
+    #     if not state.log_history:
+    #         return
+
+    #     last_logs = state.log_history[-1]
+    #     extra_logs: dict[str, float] = {}
+    #     for key in ("loss", "eval_loss", "predict_loss", "reward"):
+    #         value = last_logs.get(key)
+    #         if isinstance(value, (int, float)):
+    #             extra_logs[f"{key}_precise"] = float(value)
+
+    #     if not extra_logs:
+    #         return
+
+    #     step = state.global_step
+    #     if "wandb" in args.report_to:
+    #         try:
+    #             import wandb
+    #             wandb.log(extra_logs, step=step)
+    #         except Exception:
+    #             pass
+
+    #     if self.finetuning_args.use_swanlab:
+    #         try:
+    #             import swanlab  # type: ignore
+    #             swanlab.log(extra_logs, step=step)
+    #         except Exception:
+    #             pass

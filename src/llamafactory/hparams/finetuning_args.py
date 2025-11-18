@@ -515,38 +515,49 @@ class FinetuningArguments(
     )
 
     # Length Value Model (LVM) specific options
-    lvm_loss: Literal["mse", "smooth_l1"] = field(
-        default="mse",
-        metadata={"help": "Loss function to optimize in LVM training (mse or smooth_l1)."},
-    )
-    lvm_use_log1p: bool = field(
-        default=False,
-        metadata={
-            "help": (
-                "Apply log1p transform to length labels and train in log-space. "
-                "Predictions are exponentiated back (expm1 + clamp to >=0) for metrics."
-            )
-        },
-    )
-    lvm_use_sigmoid: bool = field(
-        default=False,
-        metadata={"help": "Apply sigmoid transform to length predictions."},
-    )
-    lvm_smooth_l1_beta: float = field(
+    # lvm_loss: Literal["mse", "smooth_l1"] = field(
+    #     default="mse",
+    #     metadata={"help": "Loss function to optimize in LVM training (mse or smooth_l1)."},
+    # )
+    # lvm_use_log1p: bool = field(
+    #     default=False,
+    #     metadata={
+    #         "help": (
+    #             "Apply log1p transform to length labels and train in log-space. "
+    #             "Predictions are exponentiated back (expm1 + clamp to >=0) for metrics."
+    #         )
+    #     },
+    # )
+    # lvm_use_sigmoid: bool = field(
+    #     default=False,
+    #     metadata={"help": "Apply sigmoid transform to length predictions."},
+    # )
+    lvm_huber_loss_delta: float = field(
         default=1.0,
-        metadata={"help": "Beta parameter for SmoothL1 (Huber) loss in LVM training."},
+        metadata={"help": "Delta parameter for Huber (SmoothL1) loss in LVM training."},
     )
-    lvm_decay_factor: float = field(
+    # lvm_decay_factor: float = field(
+    #     default=1.0,
+    #     metadata={
+    #         "help": (
+    #             "Decay factor for future token values in LVM training. "
+    #             "Future tokens are weighted as 1 * decay_factor^(n-1) where n is the distance from current token. "
+    #             "Set to 1.0 to disable decay (default behavior)."
+    #         )
+    #     },
+    # )
+    lvm_gamma: float = field(
+        default=0.999,
+        metadata={"help": "Gamma parameter for GAE in LVM training."},
+    )
+    lvm_lam: float = field(
         default=1.0,
-        metadata={
-            "help": (
-                "Decay factor for future token values in LVM training. "
-                "Future tokens are weighted as 1 * decay_factor^(n-1) where n is the distance from current token. "
-                "Set to 1.0 to disable decay (default behavior)."
-            )
-        },
+        metadata={"help": "Lambda parameter for GAE in LVM training."},
     )
-
+    lvm_agg_method: Literal["token-mean", "seq-mean-token-sum", "seq-mean-token-mean"] = field(
+        default="token-mean",
+        metadata={"help": "Method to aggregate the loss in LVM training."},
+    )
     def __post_init__(self):
         def split_arg(arg):
             if isinstance(arg, str):
@@ -603,6 +614,16 @@ class FinetuningArguments(
 
             if self.pissa_init:
                 raise ValueError("`pissa_init` is only valid for LoRA training.")
+
+        gamma = self.lvm_gamma
+        assert 0.0 < gamma <= 1.0, "gamma must be (0.0, 1.0]"
+        lam = self.lvm_lam
+        assert 0.0 <= lam <= 1.0, "lam must be [0.0, 1.0]"
+        delta = self.lvm_huber_loss_delta
+        assert 0.0 <= delta, "delta must be [0.0, inf)"
+        agg_method = self.lvm_agg_method
+        if agg_method not in ["token-mean", "seq-mean-token-sum", "seq-mean-token-mean"]:
+            raise ValueError(f"Invalid agg_method: {agg_method}")
 
     def to_dict(self) -> dict[str, Any]:
         args = asdict(self)
