@@ -554,9 +554,17 @@ class FinetuningArguments(
         default=1.0,
         metadata={"help": "Lambda parameter for GAE in LVM training."},
     )
-    lvm_agg_method: Literal["token-mean", "seq-mean-token-sum", "seq-mean-token-mean"] = field(
+    lvm_agg_method: Literal["token-mean", "seq-mean-token-sum", "seq-mean-token-mean", "seq-mean-token-mean-max"] = field(
         default="token-mean",
         metadata={"help": "Method to aggregate the loss in LVM training."},
+    )
+    lvm_alpha: float = field(
+        default=0.0,
+        metadata={"help": "Alpha parameter for LVM training."},
+    )
+    lvm_relative_loss: bool = field(
+        default=False,
+        metadata={"help": "Whether to use the relative loss in LVM training."},
     )
     def __post_init__(self):
         def split_arg(arg):
@@ -622,7 +630,7 @@ class FinetuningArguments(
         delta = self.lvm_huber_loss_delta
         assert 0.0 <= delta, "delta must be [0.0, inf)"
         agg_method = self.lvm_agg_method
-        if agg_method not in ["token-mean", "seq-mean-token-sum", "seq-mean-token-mean"]:
+        if agg_method not in ["token-mean", "seq-mean-token-sum", "seq-mean-token-mean", "seq-mean-token-mean-max"]:
             raise ValueError(f"Invalid agg_method: {agg_method}")
 
     def to_dict(self) -> dict[str, Any]:

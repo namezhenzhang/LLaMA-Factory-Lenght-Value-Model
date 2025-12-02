@@ -50,6 +50,12 @@ def run_lvm(
         model.v_head.dropout = nn.Identity()
     else:
         raise ValueError("Value head not found in model")
+
+    # Disable bias in value head
+    if hasattr(model, "v_head") and hasattr(model.v_head, "summary"):
+        if hasattr(model.v_head.summary, "bias") and model.v_head.summary.bias is not None:
+            model.v_head.summary.bias = None
+    print(model.v_head.summary.weight.data)
     print(model)
     
     data_collator = LengthValueDataCollator(
