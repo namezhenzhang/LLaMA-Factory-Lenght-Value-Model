@@ -16,6 +16,8 @@
 # limitations under the License.
 
 from typing import TYPE_CHECKING, Optional
+
+import torch
 from torch import nn
 
 from ...data import LengthValueDataCollator, get_dataset, get_template_and_fix_tokenizer
@@ -33,6 +35,38 @@ if TYPE_CHECKING:
     from ...hparams import DataArguments, FinetuningArguments, ModelArguments
 
 
+def _enable_value_head_high_precision_mode(model: "torch.nn.Module", dtype: torch.dtype = torch.float32) -> None:
+    r"""Force value head to run in float32 (inputs and outputs), while keeping the rest of the model unchanged."""
+    if not (hasattr(model, "v_head") and hasattr(model.v_head, "summary")):
+        raise ValueError("Value head not found in model")
+
+    v_head = model.v_head
+    # Ensure parameters of the linear layer are float32
+    v_head.summary = v_head.summary.to(dtype)
+
+    def _cast_nested_to_float32(x):
+        if isinstance(x, torch.Tensor):
+            return x.to(dtype)
+        if isinstance(x, (list, tuple)):
+            xs = [ _cast_nested_to_float32(xx) for xx in x ]
+            return type(x)(xs)
+        if isinstance(x, dict):
+            return {k: _cast_nested_to_float32(v) for k, v in x.items()}
+        return x
+
+    def _pre_hook(module, inputs):
+        # Cast all tensor inputs to float32 before the linear layer
+        return tuple(_cast_nested_to_float32(i) for i in inputs)
+
+    def _post_hook(module, inputs, output):
+        # Ensure outputs stay in float32
+        return _cast_nested_to_float32(output)
+
+    # Register hooks on the actual linear layer used as value head
+    v_head.summary.register_forward_pre_hook(_pre_hook)
+    v_head.summary.register_forward_hook(_post_hook)
+
+
 def run_lvm(
     model_args: "ModelArguments",
     data_args: "DataArguments",
@@ -45,6 +79,7 @@ def run_lvm(
     template = get_template_and_fix_tokenizer(tokenizer, data_args)
     dataset_module = get_dataset(template, model_args, data_args, training_args, stage="lvm", **tokenizer_module)
     model = load_model(tokenizer, model_args, finetuning_args, training_args.do_train, add_valuehead=True)
+
     # Disable dropout in value head
     if hasattr(model, "v_head") and hasattr(model.v_head, "dropout"):
         model.v_head.dropout = nn.Identity()
@@ -55,8 +90,12 @@ def run_lvm(
     if hasattr(model, "v_head") and hasattr(model.v_head, "summary"):
         if hasattr(model.v_head.summary, "bias") and model.v_head.summary.bias is not None:
             model.v_head.summary.bias = None
-    print(model.v_head.summary.weight.data)
-    print(model)
+
+    # Force value head (its linear layer) to run strictly in float32:
+    #   - inputs to the linear layer are cast to float32
+    #   - the linear transformation itself uses float32 weights
+    #   - outputs from the linear layer stay in float32
+    _enable_value_head_high_precision_mode(model, dtype=torch.float32)
     
     data_collator = LengthValueDataCollator(
         template=template, model=model, pad_to_multiple_of=8, compute_dtype=model_args.compute_dtype, **tokenizer_module
