@@ -6,12 +6,13 @@ import json
 import logging
 import random
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import datasets
 import httpx
 import matplotlib.pyplot as plt
 import openai
+from tqdm import tqdm
 from tqdm.asyncio import tqdm_asyncio
 
 MATH_QUERY_TEMPLATE = """
@@ -57,6 +58,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--retry-initial-delay", type=float, default=1.0, help="Initial delay in seconds before the first retry")
     parser.add_argument("--retry-max-delay", type=float, default=30.0, help="Maximum backoff delay in seconds between retries")
     parser.add_argument("--request-timeout", type=float, default=60.0, help="Per-request timeout in seconds for the OpenAI client")
+    parser.add_argument("--save-batch-size", type=int, default=0, help="Save intermediate results every N successful completions (0 = only save at the end)")
     return parser.parse_args()
 
 
@@ -88,14 +90,20 @@ def load_existing_data(path: Path) -> Tuple[List[Dict[str, Any]], Dict[int, int]
         logger.warning("Existing data file %s does not contain a list; ignoring its contents", path)
         return [], {}
 
-    counts: Dict[int, int] = {}
+    # Key is a normalized sample identifier (typically meta_info.extra_info["index"])
+    counts: Dict[str, int] = {}
     for entry in data:
         if not isinstance(entry, dict):
             continue
         meta = maybe_get(entry, "meta_info")
-        idx = maybe_get(meta, "extra_info").get("index")
-        if isinstance(idx, int):
-            counts[idx] = counts.get(idx, 0) + 1
+        extra = maybe_get(meta, "extra_info")
+        idx = None
+        if isinstance(extra, dict):
+            idx = extra.get("index")
+        if idx is not None:
+            # Normalize to string so that we can handle both int and UUID-like ids
+            key = str(idx)
+            counts[key] = counts.get(key, 0) + 1
     return data, counts
 
 
@@ -149,6 +157,8 @@ async def collect_dataset(
     retry_max_delay: float,
     request_timeout: float,
     existing_counts: Dict[int, int],
+    save_batch_size: int = 0,
+    batch_callback: Optional[Callable[[List[Dict[str, Any]]], None]] = None,
 ) -> List[Dict[str, Any]]:
     semaphore = asyncio.Semaphore(max(1, max_concurrency))
     timeout = None
@@ -180,8 +190,11 @@ async def collect_dataset(
 
     max_retries_clamped = max(0, max_retries)
 
-    async def generate_with_limit(sample_idx: int, sample: Dict[str, Any], prompt: str) -> Optional[Dict[str, Any]]:
-        sample_hint: Any = sample.get("extra_info").get("index")
+    async def generate_with_limit(sample_idx: str, sample: Dict[str, Any], prompt: str) -> Optional[Dict[str, Any]]:
+        sample_extra = sample.get("extra_info") or {}
+        sample_hint: Any = None
+        if isinstance(sample_extra, dict):
+            sample_hint = sample_extra.get("index")
         if sample_hint is None:
             fallback = sample.get("question")
             if isinstance(fallback, str):
@@ -233,8 +246,17 @@ async def collect_dataset(
 
     tasks: List[asyncio.Task] = []
     for sample in samples:
-        sample_idx = sample.get("extra_info").get("index")
-        assigned = existing_counts.get(sample_idx, 0)
+        sample_extra = sample.get("extra_info") or {}
+        raw_idx = None
+        if isinstance(sample_extra, dict):
+            raw_idx = sample_extra.get("index")
+        # If index is missing, fall back to the added "idx" column (if present)
+        if raw_idx is None:
+            raw_idx = sample.get("idx")
+        # Normalize to string so it can match what load_existing_data stored
+        sample_idx = str(raw_idx) if raw_idx is not None else None
+
+        assigned = existing_counts.get(sample_idx, 0) if sample_idx is not None else 0
         missing_count = max(0, samples_per_question - assigned)
         if missing_count <= 0:
             continue
@@ -242,11 +264,33 @@ async def collect_dataset(
         for _ in range(missing_count):
             tasks.append(asyncio.create_task(generate_with_limit(sample_idx, sample, prompt)))
 
+    results: List[Optional[Dict[str, Any]]] = []
+    batch: List[Dict[str, Any]] = []
+
     try:
-        results: List[Optional[Dict[str, Any]]] = await tqdm_asyncio.gather(
-            *tasks, total=len(tasks), desc="Generating completions"
-        )
+        for task in tqdm(
+            asyncio.as_completed(tasks),
+            total=len(tasks),
+            desc="Generating completions",
+        ):
+            res = await task
+            results.append(res)
+
+            if res is not None and save_batch_size > 0 and batch_callback is not None:
+                batch.append(res)
+                if len(batch) >= save_batch_size:
+                    try:
+                        batch_callback(batch)
+                    except Exception:
+                        logger.exception("Error while executing batch_callback; continuing.")
+                    batch = []
     finally:
+        # Flush remaining partial batch, if any
+        if batch and save_batch_size > 0 and batch_callback is not None:
+            try:
+                batch_callback(batch)
+            except Exception:
+                logger.exception("Error while executing final batch_callback; continuing.")
         await client.close()
 
     successful_results = [item for item in results if item is not None]
@@ -330,6 +374,24 @@ def main() -> None:
     output_path = resolve_save_path(args.save_path, args.num_samples)
     existing_data, existing_counts = load_existing_data(output_path)
 
+    # For incremental saving, we accumulate new data and re-write the merged file
+    new_data: List[Dict[str, Any]] = []
+
+    def batch_callback(batch: List[Dict[str, Any]]) -> None:
+        """
+        Synchronously persist intermediate results:
+        - Extend in-memory new_data
+        - Write existing_data + new_data to output_path
+        """
+        nonlocal new_data
+        if not batch:
+            return
+        new_data.extend(batch)
+        ensure_parent_dir(output_path)
+        merged = existing_data + new_data
+        with output_path.open("w", encoding="utf-8") as file:
+            json.dump(merged, file, indent=4, ensure_ascii=False)
+
     data = asyncio.run(
         collect_dataset(
             prepared_dataset,
@@ -346,6 +408,8 @@ def main() -> None:
             retry_max_delay=args.retry_max_delay,
             request_timeout=args.request_timeout,
             existing_counts=existing_counts,
+            save_batch_size=max(0, args.save_batch_size),
+            batch_callback=batch_callback if args.save_batch_size > 0 else None,
         )
     )
 
