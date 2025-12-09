@@ -1,0 +1,55 @@
+### model
+model_name_or_path: Qwen/Qwen3-4B-Instruct-2507
+trust_remote_code: true
+
+### method
+stage: lvm
+do_train: true
+finetuning_type: full
+deepspeed: examples/deepspeed/ds_z3_offload_config.json  # choices: [ds_z0_config.json, ds_z2_config.json, ds_z3_config.json]
+lvm_huber_loss_delta: 0.5
+lvm_gamma: 0.9997 # GAE parameter
+lvm_lam: 0.997 # GAE parameter
+lvm_agg_method: seq-mean-token-mean-max
+
+### dataset
+dataset: dapo_math_17k_7398_16
+template: qwen
+cutoff_len: 12000
+max_samples: 100000000000
+overwrite_cache: true
+preprocessing_num_workers: 64
+dataloader_num_workers: 16
+
+### output
+output_dir: saves/qwen3-4b/full/lvm-dapo-17k-7398-16-lr1e-5-g0.9997-l0.997-d0.5-gpu8-bs1-ga16-ep2-wu30-cut12000
+logging_steps: 1
+save_steps: 300
+save_strategy: epoch
+plot_loss: true
+overwrite_output_dir: true
+save_only_model: false
+save_safetensors: false
+report_to: wandb  # choices: [none, wandb, tensorboard, swanlab, mlflow]
+run_name: lvm/qwen3-4b/lvm-dapo-17k-7398-16-lr1e-5-g0.9997-l0.997-d0.5-gpu8-bs1-ga16-ep2-wu30-cut12000
+
+### train
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 8
+learning_rate: 1.0e-5
+num_train_epochs: 2.0
+lr_scheduler_type: constant
+# warmup_ratio: 0.1
+warmup_steps: 30
+bf16: false
+fp16: true
+ddp_timeout: 180000000
+resume_from_checkpoint: null
+
+
+### eval
+# eval_dataset: dpo_en_demo
+# val_size: 0.1
+# per_device_eval_batch_size: 1
+# eval_strategy: steps
+# eval_steps: 500

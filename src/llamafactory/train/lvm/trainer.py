@@ -215,7 +215,6 @@ class LengthValueTrainer(Trainer):
         value_mask = inputs.pop("value_mask").to(torch.float64) # mask of response tokens
         response_len = value_mask.sum(dim=-1)
 
-
         value_preds = self._forward_value(model, inputs).to(torch.float64)
 
         gamma = self.finetuning_args.lvm_gamma
@@ -226,6 +225,7 @@ class LengthValueTrainer(Trainer):
             lam = self.finetuning_args.lvm_lam
         delta = self.finetuning_args.lvm_huber_loss_delta
         agg_method = self.finetuning_args.lvm_agg_method
+        lvm_relative_loss = self.finetuning_args.lvm_relative_loss
         reward = 1.0 - gamma
 
         y_hat = torch.sigmoid(value_preds)
@@ -234,13 +234,19 @@ class LengthValueTrainer(Trainer):
             advantages, returns = self._compute_gae_advantage_return(y_hat, value_mask, reward, gamma, lam)
             # advantages = verl_F.masked_whiten(advantages, value_mask)
 
-        # value_loss = torch.nn.functional.huber_loss(
-        #     y_hat, returns, reduction="none", delta=delta
-        # )
-        value_loss = 0.5 * (y_hat-returns) ** 2
+        value_loss = torch.nn.functional.huber_loss(
+            y_hat, returns, reduction="none", delta=delta
+        )
+        # value_loss = 0.5 * (y_hat-returns) ** 2
+
+        # Optionally convert to relative loss so that positions with
+        # larger target values do not dominate the overall loss.
+        if lvm_relative_loss:
+            eps = 1e-8
+            value_loss = value_loss / (returns.abs() + eps)
+
         value_loss = self.aggregate_loss(value_loss, value_mask, method = agg_method)
-        # if self.accelerator.is_main_process:
-        #     import pdb; pdb.set_trace()
+
         with torch.no_grad():
             # Compute and report losses for lam=0 and lam=1 (diagnostics only)
             _, returns_lam0 = self._compute_gae_advantage_return(y_hat, value_mask, reward, gamma, 0.0)
@@ -252,11 +258,6 @@ class LengthValueTrainer(Trainer):
             rel_loss_lam0 = torch.abs(y_hat - returns_lam0) / (torch.abs(returns_lam0) + eps)
             rel_loss_lam0 = self.aggregate_loss(rel_loss_lam0, value_mask, method = "seq-sum-token-sum")
 
-            # _, returns_lam05 = self._compute_gae_advantage_return(y_hat, value_mask, reward, gamma, 0.5)
-            # loss_lam05 = F.huber_loss(y_hat, returns_lam05, reduction="none", delta=delta)
-            # # loss_lam05 = 0.5 * (y_hat-returns_lam05) ** 2
-            # loss_lam05 = self.aggregate_loss(loss_lam05, value_mask, method = agg_method)
-            
             _, returns_lam1 = self._compute_gae_advantage_return(y_hat, value_mask, reward, gamma, 1.0)
             # loss_lam1 = F.huber_loss(y_hat, returns_lam1, reduction="none", delta=delta)
             loss_lam1 = 0.5 * (y_hat-returns_lam1) ** 2
@@ -264,7 +265,7 @@ class LengthValueTrainer(Trainer):
             # relative loss: |y_hat - returns_lam1| / (|returns_lam1| + eps)
             rel_loss_lam1 = torch.abs(y_hat - returns_lam1) / (torch.abs(returns_lam1) + eps)
             rel_loss_lam1 = self.aggregate_loss(rel_loss_lam1, value_mask, method = "seq-sum-token-sum")
-            
+
             # Accumulate diagnostics across micro-steps (gradient accumulation)
             # We store the *sum* of losses and the *sum* of valid tokens,
             # then divide by total tokens when logging.
@@ -273,7 +274,6 @@ class LengthValueTrainer(Trainer):
             # self._diag_ga_sum_main += float(value_loss.detach())  # already normalized loss
             self._diag_ga_sum_lam0 += float(loss_lam0.detach())
             self._diag_ga_sum_lam1 += float(loss_lam1.detach())
-            # self._diag_ga_sum_lam05 += float(loss_lam05.detach())
             # accumulate relative losses
             self._diag_ga_sum_rel_lam0 += float(rel_loss_lam0.detach())
             self._diag_ga_sum_rel_lam1 += float(rel_loss_lam1.detach())
@@ -303,7 +303,6 @@ class LengthValueTrainer(Trainer):
                     if self.accelerator.is_main_process:
                         # avg_main = (sum_main / cnt.clamp_min(1.0)).item()
                         avg_l0 = (sum_l0 / cnt.clamp_min(1.0)).item()
-                        # avg_l05 = (sum_l05 / cnt.clamp_min(1.0)).item()
                         avg_l1 = (sum_l1 / cnt.clamp_min(1.0)).item()
                         avg_rel_l0 = (sum_rel_l0 / cnt.clamp_min(1.0)).item()
                         avg_rel_l1 = (sum_rel_l1 / cnt.clamp_min(1.0)).item()
@@ -312,7 +311,6 @@ class LengthValueTrainer(Trainer):
                             {
                                 # f"train/value_loss_lam{lam}": avg_main,
                                 "train/value_loss_lam0": avg_l0,
-                                # "train/value_loss_lam05": avg_l05,
                                 "train/value_loss_lam1": avg_l1,
                                 "train/value_rel_loss_lam0": avg_rel_l0,
                                 "train/value_rel_loss_lam1": avg_rel_l1,
@@ -321,7 +319,6 @@ class LengthValueTrainer(Trainer):
                 # reset accumulators after optimizer step
                 # self._diag_ga_sum_main = 0.0
                 self._diag_ga_sum_lam0 = 0.0
-                # self._diag_ga_sum_lam05 = 0.0
                 self._diag_ga_sum_lam1 = 0.0
                 self._diag_ga_sum_rel_lam0 = 0.0
                 self._diag_ga_sum_rel_lam1 = 0.0
