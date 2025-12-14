@@ -15,9 +15,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import MethodType
 from typing import TYPE_CHECKING, Optional
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from ...data import LengthValueDataCollator, get_dataset, get_template_and_fix_tokenizer
@@ -41,30 +43,16 @@ def _enable_value_head_high_precision_mode(model: "torch.nn.Module", dtype: torc
         raise ValueError("Value head not found in model")
 
     v_head = model.v_head
-    # Ensure parameters of the linear layer are float32
-    v_head.summary = v_head.summary.to(dtype)
 
-    def _cast_nested_to_float32(x):
-        if isinstance(x, torch.Tensor):
-            return x.to(dtype)
-        if isinstance(x, (list, tuple)):
-            xs = [ _cast_nested_to_float32(xx) for xx in x ]
-            return type(x)(xs)
-        if isinstance(x, dict):
-            return {k: _cast_nested_to_float32(v) for k, v in x.items()}
-        return x
+    # Override forward to cast inputs and weights to float32 dynamically
+    # This is necessary because DeepSpeed ZeRO-3 might cast weights back to bf16 during forward
+    def forward_in_float32(self, input: torch.Tensor) -> torch.Tensor:
+        input = input.to(dtype)
+        weight = self.weight.to(dtype)
+        bias = self.bias.to(dtype) if self.bias is not None else None
+        return F.linear(input, weight, bias)
 
-    def _pre_hook(module, inputs):
-        # Cast all tensor inputs to float32 before the linear layer
-        return tuple(_cast_nested_to_float32(i) for i in inputs)
-
-    def _post_hook(module, inputs, output):
-        # Ensure outputs stay in float32
-        return _cast_nested_to_float32(output)
-
-    # Register hooks on the actual linear layer used as value head
-    v_head.summary.register_forward_pre_hook(_pre_hook)
-    v_head.summary.register_forward_hook(_post_hook)
+    v_head.summary.forward = MethodType(forward_in_float32, v_head.summary)
 
 
 def run_lvm(

@@ -6,9 +6,10 @@ import json
 import logging
 import random
 import sys
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional
 
 import datasets
 import httpx
@@ -25,7 +26,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Constants
-MATH_QUERY_TEMPLATE = "{Question}"
+MATH_QUERY_TEMPLATE = """
+Please reason step by step, and put your final answer within \\boxed{{}}.
+
+{Question}
+""".strip()
 RETRYABLE_STATUS_CODES = {408, 409, 423, 425, 429, 499}
 
 
@@ -85,7 +90,7 @@ class DataGenerator:
         """Determines if the exception is retryable."""
         if isinstance(exc, (openai.APIConnectionError, openai.APITimeoutError, openai.RateLimitError, httpx.ReadTimeout)):
             return True
-        
+
         status_code = getattr(exc, "status_code", None)
         if isinstance(exc, httpx.HTTPStatusError):
             status_code = exc.response.status_code
@@ -107,7 +112,7 @@ class DataGenerator:
                         max_tokens=self.config.max_tokens,
                         top_p=self.config.top_p,
                     )
-                    
+
                     answer = response.choices[0].message.content
                     completion_tokens = getattr(response.usage, "completion_tokens", None) if response.usage else None
                     
@@ -128,7 +133,7 @@ class DataGenerator:
                     if attempt >= self.config.max_retries or not self._should_retry(exc):
                         logger.error(f"Failed to process sample after {attempt+1} attempts: {exc}")
                         return None
-                    
+
                     delay = calculate_backoff_delay(attempt + 1, self.config.retry_initial_delay, self.config.retry_max_delay)
                     logger.warning(f"Retry {attempt+1}/{self.config.max_retries} in {delay:.2f}s due to {type(exc).__name__}")
                     await asyncio.sleep(delay)
@@ -161,7 +166,7 @@ def load_existing_data(path: Path) -> Dict[str, int]:
                     continue
     except Exception as exc:
         logger.warning(f"Error reading existing data from {path}: {exc}")
-    
+
     return counts
 
 
@@ -169,7 +174,7 @@ async def save_batch(path: Path, batch: List[Dict[str, Any]]):
     """Appends a batch of results to the output file."""
     if not batch:
         return
-    
+
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         with path.open("a", encoding="utf-8") as f:
@@ -177,6 +182,73 @@ async def save_batch(path: Path, batch: List[Dict[str, Any]]):
                 f.write(json.dumps(item, ensure_ascii=False) + "\n")
     except Exception as exc:
         logger.error(f"Failed to save batch to {path}: {exc}")
+
+
+def group_shuffle_jsonl_by_index(
+    input_path: Path,
+    seed: int,
+    output_path: Optional[Path] = None,
+    inplace: bool = True,
+) -> Path:
+    """
+    Reorder a jsonl file so that samples with the same meta_info.extra_info.index are adjacent,
+    while keeping randomness:
+    - shuffle the order of index groups
+    - shuffle items within each index group
+    """
+    if not input_path.exists():
+        raise FileNotFoundError(f"Input jsonl not found: {input_path}")
+
+    groups: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    passthrough_lines: List[str] = []
+
+    with input_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            raw = line.rstrip("\n")
+            if not raw.strip():
+                continue
+            try:
+                obj = json.loads(raw)
+            except json.JSONDecodeError:
+                # Keep malformed lines (rare) at the end rather than dropping.
+                passthrough_lines.append(raw)
+                continue
+
+            meta = safe_get(obj, "meta_info")
+            extra = safe_get(meta, "extra_info")
+            idx = safe_get(extra, "index")
+            if idx is None:
+                passthrough_lines.append(raw)
+                continue
+            groups[str(idx)].append(obj)
+
+    rng = random.Random(seed)
+    keys = list(groups.keys())
+    rng.shuffle(keys)
+    for k in keys:
+        rng.shuffle(groups[k])
+
+    if output_path is None:
+        output_path = input_path
+
+    if inplace and output_path == input_path:
+        tmp_path = input_path.with_suffix(input_path.suffix + ".tmp")
+        write_path = tmp_path
+    else:
+        write_path = output_path
+
+    write_path.parent.mkdir(parents=True, exist_ok=True)
+    with write_path.open("w", encoding="utf-8") as wf:
+        for k in keys:
+            for obj in groups[k]:
+                wf.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        for raw in passthrough_lines:
+            wf.write(raw + "\n")
+
+    if inplace and output_path == input_path:
+        write_path.replace(input_path)
+        return input_path
+    return write_path
 
 
 async def process_dataset(
@@ -189,19 +261,19 @@ async def process_dataset(
 ):
     """Main processing loop: schedules tasks and saves results."""
     tasks = []
-    
+
     # Create tasks only for missing samples
     for sample in samples:
         # We ensure 'index' exists in extra_info during preprocessing
         idx = str(sample.get("extra_info", {}).get("index"))
         if not idx:
-             continue
-             
+            continue
+
         current_count = existing_counts.get(idx, 0)
         needed = max(0, samples_per_question - current_count)
-        
+
         if needed > 0:
-            prompt = MATH_QUERY_TEMPLATE.format(Question=sample["source_prompt"][0]["content"])
+            prompt = MATH_QUERY_TEMPLATE.format(Question=sample["prompt"])
             for _ in range(needed):
                 tasks.append(generator.process_sample(sample, prompt))
                 # Update local count to avoid over-scheduling if duplicates exist in source
@@ -217,18 +289,18 @@ async def process_dataset(
 
     results = []
     batch = []
-    
+
     # Execute tasks
     for future in tqdm_asyncio.as_completed(tasks, desc="Generating"):
         result = await future
         if result:
             results.append(result)
             batch.append(result)
-            
+
             if save_batch_size > 0 and len(batch) >= save_batch_size:
                 await save_batch(save_path, batch)
                 batch = []
-    
+
     # Save remaining items
     if batch and save_batch_size > 0:
         await save_batch(save_path, batch)
@@ -238,7 +310,7 @@ async def process_dataset(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="DAPO Math Data Generation")
-    
+
     # Dataset args
     parser.add_argument("--dataset-name", default="open-r1/DAPO-Math-17k-Processed")
     parser.add_argument("--dataset-split", default="train")
@@ -248,6 +320,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-batch-size", type=int, default=10)
     parser.add_argument("--random-seed", type=int, default=42)
     parser.add_argument("--plot-difficulty", action="store_true", help="Unused but preserved for compatibility")
+    parser.add_argument(
+        "--reorder-only",
+        action="store_true",
+        help="Only reorder an existing jsonl specified by --save-path (no dataset loading / generation).",
+    )
+    parser.add_argument(
+        "--group-by-index",
+        action="store_true",
+        help='After generation, reorder jsonl so same meta_info.extra_info.index are contiguous; '
+             "shuffle group order + shuffle within each group.",
+    )
+    parser.add_argument(
+        "--group-output-path",
+        default=None,
+        help="Optional output path for grouped jsonl (default: overwrite --save-path in-place).",
+    )
 
     # Model/API args
     parser.add_argument("--model-name", default="Qwen/Qwen2.5-7B-Instruct")
@@ -257,13 +345,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--openai-base-url", default="http://127.0.0.1:10001/v1")
     parser.add_argument("--openai-api-key", default=None)
     parser.add_argument("--max-concurrency", type=int, default=1000)
-    
+
     # Reliability args
     parser.add_argument("--max-retries", type=int, default=5)
     parser.add_argument("--retry-initial-delay", type=float, default=1.0)
     parser.add_argument("--retry-max-delay", type=float, default=30.0)
     parser.add_argument("--request-timeout", type=float, default=60.0)
-    
+
     return parser.parse_args()
 
 
@@ -273,7 +361,19 @@ def main():
     # 1. Setup paths
     save_path = Path(args.save_path) if args.save_path else \
         Path(__file__).resolve().parent.parent / "data" / f"dapo_math_17k_{args.num_samples}.jsonl"
-    
+
+    # Optional: only reorder an existing jsonl and exit.
+    if args.reorder_only:
+        grouped_path = Path(args.group_output_path) if args.group_output_path else save_path
+        group_shuffle_jsonl_by_index(
+            input_path=save_path,
+            seed=args.random_seed,
+            output_path=grouped_path,
+            inplace=(args.group_output_path is None),
+        )
+        logger.warning(f"Grouped/shuffled jsonl saved to: {grouped_path}")
+        return
+
     # 2. Load and Preprocess Dataset
     try:
         ds = datasets.load_dataset(args.dataset_name, split=args.dataset_split)
@@ -284,14 +384,14 @@ def main():
     # Add 'idx' if missing
     if "idx" not in ds.column_names:
         ds = ds.add_column("idx", list(range(len(ds))))
-        
+
     # Shuffle and select samples
     ds = ds.shuffle(seed=args.random_seed)
     if 0 < args.num_samples < len(ds):
         ds = ds.select(range(args.num_samples))
     elif args.num_samples > len(ds):
         logger.warning(f"Requested {args.num_samples} samples but dataset only has {len(ds)}.")
-        
+
     # Ensure extra_info.index exists for tracking
     def ensure_index(example):
         # Handle dict/obj differences if any (though mapped example is dict)
@@ -300,9 +400,9 @@ def main():
             extra["index"] = example["idx"]
         example["extra_info"] = extra
         return example
-        
+
     ds = ds.map(ensure_index)
-    
+
     # 3. Save Indices
     indices_path = save_path.with_name(f"{save_path.stem}_indices.json")
     indices_path.parent.mkdir(parents=True, exist_ok=True)
@@ -312,10 +412,10 @@ def main():
         logger.info(f"Saved indices to {indices_path}")
     except Exception as e:
         logger.error(f"Failed to save indices: {e}")
-    
+
     # 4. Initialize Generation
     existing_counts = load_existing_data(save_path)
-    
+
     config = GenerationConfig(
         model_name=args.model_name,
         temperature=args.temperature,
@@ -328,8 +428,8 @@ def main():
         retry_max_delay=args.retry_max_delay,
         request_timeout=args.request_timeout,
     )
-    
-    # 5. Run
+
+    # 5. Run: use a single event loop for processing and cleanup
     generator = DataGenerator(config, args.max_concurrency)
     try:
         asyncio.run(process_dataset(
@@ -342,8 +442,20 @@ def main():
         ))
     except KeyboardInterrupt:
         logger.info("Process interrupted by user.")
-    finally:
-        asyncio.run(generator.close())
+        return
+
+    if args.group_by_index:
+        grouped_path = Path(args.group_output_path) if args.group_output_path else save_path
+        try:
+            group_shuffle_jsonl_by_index(
+                input_path=save_path,
+                seed=args.random_seed,
+                output_path=grouped_path,
+                inplace=(args.group_output_path is None),
+            )
+            logger.warning(f"Grouped/shuffled jsonl saved to: {grouped_path}")
+        except Exception as e:
+            logger.error(f"Failed to group/shuffle jsonl: {e}")
 
 
 if __name__ == "__main__":
