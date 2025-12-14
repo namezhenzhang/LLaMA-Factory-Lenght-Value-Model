@@ -7,7 +7,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument(
     "--length-value-model-dir",
     type=str,
-    default="/data2/zzhang/dir1/LLaMA-Factory-Lenght-Value-Model/saves/qwen2.5-3b/full/lvm-dapo-17k-112000-4-lr2e-5-g0.999-l0.997-d0.5-gpu4-bs2-ga64-ep5-wu30-cut4096",
+    default="saves/qwen2.5-3b/full/lvm-dapo-17k-112000-4-lr2e-5-g0.999-l0.997-d0.5-gpu4-bs2-ga64-ep5-wu30-cut4096",
 )
 parser.add_argument(
     "--inference-model-dir",
@@ -40,6 +40,13 @@ parser.add_argument(
     default=False,
     help="Enable LVM-based probability modification.",
 )
+parser.add_argument(
+    "--lvm-select",
+    type=str,
+    choices=["max", "min"],
+    default="max",
+    help="Whether to pick token with maximum or minimum LVM log_val.",
+)
 
 # 采样与解码参数
 parser.add_argument("--repetition-penalty", type=float, default=1.05)
@@ -51,7 +58,13 @@ parser.add_argument("--max-new-tokens", type=int, default=2048)
 # batch / rollout 参数
 parser.add_argument("--num-questions", type=int, default=10)
 parser.add_argument("--num-rollouts", type=int, default=8)
-parser.add_argument("--max-batch-size", type=int, default=8)
+parser.add_argument("--max-batch-size", type=int, default=8)  # 主模型外层 batch 大小
+parser.add_argument(
+    "--max-lvm-batch-size",
+    type=int,
+    default=256,
+    help="候选 token 送入 LVM 时的最大 batch size，用于防止显存爆掉。",
+)
 
 args = parser.parse_args()
 print(args)
@@ -61,6 +74,7 @@ inference_model_dir = args.inference_model_dir
 use_gpu = args.use_gpu
 enable_flash_attn = args.enable_flash_attn
 if_modify_probs = args.if_modify_probs
+lvm_select = args.lvm_select
 
 repetition_penalty = args.repetition_penalty
 temperature = args.temperature
@@ -69,13 +83,14 @@ top_k = args.top_k
 max_new_tokens = args.max_new_tokens
 
 max_batch_size = args.max_batch_size
+max_lvm_batch_size = args.max_lvm_batch_size
 
 num_questions = args.num_questions
 num_rollouts = args.num_rollouts
 
 # %%
 import datasets
-dataset = datasets.load_dataset("BytedTsinghua-SIA/DAPO-Math-17k")
+dataset = datasets.load_dataset("open-r1/DAPO-Math-17k-Processed")
 # print(dataset["train"][0])
 
 # %%
@@ -193,58 +208,77 @@ def modify_probs(
     if nonzero_indices.numel() == 0:
         return probs
 
-    # 后面要用 batch_indices 去索引 LVM 的 KV cache。
-    # 对于新的 transformers Cache API，我们会用 Cache.batch_select_indices 来根据 batch_indices 生成子 cache。
-    batch_indices = nonzero_indices[:, 0]  # 保持在 CPU，给 Cache.batch_select_indices 使用
-    token_indices = nonzero_indices[:, 1]
-
-    # 构造候选 token 输入：(num_candidates, 1)，放到 LVM 对应的设备上
-    candidate_input_ids = token_indices.unsqueeze(-1).to(lvm_device)
-    # 注意：这里不能用全 1 的 mask，否则 LVM 看不到完整历史，只会在“几乎无上下文”的情况下打分。
-    # 应该复用当前步与主模型一致的 attention_mask，并按 batch_indices 选出对应样本。
-    candidate_attention_mask = attention_mask[batch_indices].to(lvm_device)
-
-    # 根据 transformers 版本，past_key_values 可能是 Cache 对象，也可能是旧版的 tuple 形式
-    if isinstance(lvm_past_key_values, Cache):
-        # 使用 Cache.batch_select_indices 按 batch_indices 选择对应 batch，并复制一份，避免修改原始 cache
-        candidate_past = deepcopy(lvm_past_key_values)
-        candidate_past.batch_select_indices(batch_indices.to("cpu"))
-    else:
-        # 兼容旧版 tuple[(key_states, value_states), ...] 形式
-        expanded_past = []
-        for key_states, value_states in lvm_past_key_values:
-            key_states = key_states[batch_indices].to(lvm_device)
-            value_states = value_states[batch_indices].to(lvm_device)
-            expanded_past.append((key_states, value_states))
-        candidate_past = tuple(expanded_past)
-
     # 利用 KV cache，只对候选 token 做单步前向，拿到 value
-    with torch.no_grad():
-        # AutoModelForCausalLMWithValueHead 的 forward 返回 (logits, loss, value)
-        _, _, values = lvm_model(
-            input_ids=candidate_input_ids,
-            attention_mask=candidate_attention_mask,
-            past_key_values=candidate_past,
-            use_cache=True,
-            return_past_key_values=False,
-        )
+    # 这里按 max_lvm_batch_size 对候选 token 再次分批，避免 num_candidates 过大导致显存爆掉
+    num_candidates = nonzero_indices.size(0)
+    # 先在 LVM 设备上分配，用于按顺序回填每个 candidate 的 value
+    log_val_all = torch.empty(num_candidates, device=lvm_device, dtype=torch.float32)
+    log_base = torch.log(torch.tensor(0.999, device=lvm_device, dtype=torch.float32))
 
-    token_values = values[:, -1].to(torch.float32)  # (num_candidates,)
-    sigmoid_val = torch.sigmoid(token_values)
-    log_base = torch.log(torch.tensor(0.999, device=lvm_device, dtype=token_values.dtype))
-    log_val = torch.log(1 - sigmoid_val) / log_base
+    for start in range(0, num_candidates, max_lvm_batch_size):
+        end = min(start + max_lvm_batch_size, num_candidates)
+        idx_slice = slice(start, end)
 
-    # 将 log_val 移到与 probs 相同的设备，方便后续处理
-    log_val = log_val.to(probs.device)
+        chunk_indices = nonzero_indices[idx_slice]
+        chunk_batch_indices = chunk_indices[:, 0]
+        chunk_token_indices = chunk_indices[:, 1]
 
-    # 每个样本只保留「log_val 最大」的那个 token（期望剩余长度最长）
+        # 当前子 batch 的输入
+        chunk_input_ids = chunk_token_indices.unsqueeze(-1).to(lvm_device)
+        chunk_attention_mask = attention_mask[chunk_batch_indices].to(lvm_device)
+
+        # 根据 transformers 版本构造当前子 batch 的 past_key_values
+        if isinstance(lvm_past_key_values, Cache):
+            chunk_past = deepcopy(lvm_past_key_values)
+            chunk_past.batch_select_indices(chunk_batch_indices.to("cpu"))
+        else:
+            expanded_past = []
+            for key_states, value_states in lvm_past_key_values:
+                key_states = key_states[chunk_batch_indices].to(lvm_device)
+                value_states = value_states[chunk_batch_indices].to(lvm_device)
+                expanded_past.append((key_states, value_states))
+            chunk_past = tuple(expanded_past)
+
+        with torch.no_grad():
+            # AutoModelForCausalLMWithValueHead 的 forward 返回 (logits, loss, value)
+            _, _, values = lvm_model(
+                input_ids=chunk_input_ids,
+                attention_mask=chunk_attention_mask,
+                past_key_values=chunk_past,
+                use_cache=True,
+                return_past_key_values=False,
+            )
+
+        token_values = values[:, -1].to(torch.float32)  # (chunk_size,)
+        sigmoid_val = torch.sigmoid(token_values)
+        log_val_chunk = torch.log(1 - sigmoid_val) / log_base  # (chunk_size,)
+
+        log_val_all[idx_slice] = log_val_chunk
+
+    # 将拼好的 log_val_all 移到与 probs 相同的设备，方便后续处理
+    log_val = log_val_all.to(probs.device)
+
+    # 每个样本只保留一个 token：
+    # - 当 lvm_select == "max" 时，保留「log_val 最大」的那个 token（期望剩余长度最长）
+    # - 当 lvm_select == "min" 时，保留「log_val 最小」的那个 token（期望剩余长度最短）
     batch_size, vocab_size = probs.shape
-    best_val = torch.full((batch_size,), float("-inf"), device=probs.device)
+    if lvm_select == "min":
+        best_val = torch.full((batch_size,), float("inf"), device=probs.device)
+
+        def _better(new_val, best):
+            return new_val < best
+
+    else:  # 默认按最大值选择
+        best_val = torch.full((batch_size,), float("-inf"), device=probs.device)
+
+        def _better(new_val, best):
+            return new_val > best
+
     best_token = torch.zeros((batch_size,), dtype=torch.long, device=probs.device)
 
     for idx, (b_idx, t_idx) in enumerate(nonzero_indices):
         v = log_val[idx]
-        if v > best_val[b_idx]:
+        if _better(v, best_val[b_idx]):
             best_val[b_idx] = v
             best_token[b_idx] = t_idx
 
@@ -476,7 +510,7 @@ answers = []
 question_indices = []  # 记录每条样本对应的题目索引，方便后续打印
 
 for q_idx in range(num_questions):
-    prompt = dataset["train"][q_idx]["prompt"][0]["content"]
+    prompt = dataset["train"][q_idx]["prompt"]
     answer = dataset["train"][q_idx]["reward_model"]["ground_truth"]
     for _ in range(num_rollouts):
         prompts.append(prompt)
@@ -493,7 +527,7 @@ messages_list = [
     [
         {
             "role": "user",
-            "content": prompt,
+            "content": "Please reason step by step, and put your final answer within \\boxed{{}}.\n\n" + prompt,
         }
     ]
     for prompt in prompts
@@ -541,12 +575,13 @@ for start in range(0, total_samples, max_batch_size):
         content = tokenizer.decode(output_ids, skip_special_tokens=True)
         outputs[global_idx] = content
 
-# 统计平均长度和正确率（按 “Answer: $5$” 这种格式匹配）
+# 统计平均长度和正确率（按 “\\boxed{...}” 这种格式匹配）
 def extract_answer_in_tex_format(text: str) -> str | None:
-    """从字符串中提取形如 'Answer: $...$' 的答案主体."""
-    m = re.search(r"Answer:\s*\$(.+?)\$", text)
-    if m:
-        return m.group(1).strip()
+    """从字符串中提取形如 '\\boxed{...}' 的答案主体，返回最后一次出现的那个."""
+    matches = re.findall(r"\\boxed\{(.*?)\}", text)
+    if matches:
+        # 返回最后一个匹配到的答案
+        return matches[-1].strip()
     return None
 
 
@@ -559,7 +594,7 @@ for i, (q_idx, prompt, content, answer) in enumerate(zip(question_indices, promp
     length_i = len(tokenizer.encode(content, add_special_tokens=False))
     total_length += length_i
 
-    # 提取标准答案和模型答案中 “Answer: $...$” 里的部分并比较
+    # 提取标准答案和模型答案中 “\\boxed{...}” 里的部分并比较
     gt_inner = str(answer)
     pred_inner = extract_answer_in_tex_format(content)
     is_correct = (gt_inner is not None) and (pred_inner is not None) and (gt_inner == pred_inner)
@@ -568,8 +603,8 @@ for i, (q_idx, prompt, content, answer) in enumerate(zip(question_indices, promp
     rollout_idx = i % num_rollouts
     print(f"===== Question {q_idx} - Rollout {rollout_idx} =====")
     print("Prompt:\n", prompt)
+    print("Generated Content:\n", content)
     print("Ground Truth Answer:\n", answer)
-    # print("Generated Content:\n", content)
     print(f"Output length (tokens): {length_i}, Correct: {is_correct}, GT_inner: {gt_inner}, Pred_inner: {pred_inner}")
     print()
 
@@ -577,7 +612,7 @@ if num_samples > 0:
     avg_length = total_length / num_samples
     accuracy = correct_count / num_samples
     print(f"Average output length (tokens): {avg_length:.2f}")
-    print(f"Accuracy (Answer: $...$ match): {accuracy:.4f}")
+    print(f"Accuracy (\\boxed{...} match): {accuracy:.4f}")
 
 
 # # %%
