@@ -212,6 +212,42 @@ def patch_model(
 
 
 def patch_valuehead_model(model: "AutoModelForCausalLMWithValueHead") -> None:
+    def num_parameters(
+        self: "AutoModelForCausalLMWithValueHead", only_trainable: bool = False, exclude_embeddings: bool = False, **kwargs
+    ) -> int:
+        r"""Compatibility shim for external loggers (e.g. W&B).
+
+        `trl.AutoModelForCausalLMWithValueHead` does not always expose the same API as `transformers.PreTrainedModel`.
+        Some integrations call `model.num_parameters()` and will warn if it is missing.
+        """
+        base = getattr(self, "pretrained_model", None)
+        if base is not None and hasattr(base, "num_parameters") and callable(getattr(base, "num_parameters")):
+            try:
+                # transformers.PreTrainedModel signature
+                return int(base.num_parameters(only_trainable=only_trainable, exclude_embeddings=exclude_embeddings))
+            except TypeError:
+                # other implementations
+                try:
+                    return int(base.num_parameters())
+                except Exception:
+                    pass
+
+        # Fallback: count parameters on the wrapper (includes value head).
+        def _iter_params(module: torch.nn.Module):
+            for p in module.parameters():
+                if (not only_trainable) or p.requires_grad:
+                    yield p
+
+        total = sum(p.numel() for p in _iter_params(self))
+        if exclude_embeddings:
+            try:
+                emb = self.get_input_embeddings()
+                if isinstance(emb, torch.nn.Module):
+                    total -= sum(p.numel() for p in _iter_params(emb))
+            except Exception:
+                pass
+        return int(total)
+
     def tie_weights(self: "AutoModelForCausalLMWithValueHead") -> None:
         if isinstance(self.pretrained_model, PreTrainedModel):
             self.pretrained_model.tie_weights()
@@ -243,6 +279,9 @@ def patch_valuehead_model(model: "AutoModelForCausalLMWithValueHead") -> None:
 
     ignore_modules = [name for name, _ in model.named_parameters() if "pretrained_model" in name]
     setattr(model, "_keys_to_ignore_on_save", ignore_modules)
+    # Only add the shim if the wrapper doesn't already provide it.
+    if not (hasattr(model, "num_parameters") and callable(getattr(model, "num_parameters"))):
+        setattr(model, "num_parameters", MethodType(num_parameters, model))
     setattr(model, "tie_weights", MethodType(tie_weights, model))
     setattr(model, "get_input_embeddings", MethodType(get_input_embeddings, model))
     setattr(model, "get_output_embeddings", MethodType(get_output_embeddings, model))
