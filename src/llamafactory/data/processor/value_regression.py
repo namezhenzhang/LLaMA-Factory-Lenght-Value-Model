@@ -55,9 +55,12 @@ class LengthValueDatasetProcessor(DatasetProcessor):
 
         valid_start = max(org_source_len - 1, 0)
         for idx in range(seq_len):
-            remaining = org_max_len - idx - 1 if org_target_len < self.data_args.infty_gen_length else float('inf')
+            if idx < valid_start:
+                remaining = -1
+            else:
+                remaining = org_max_len - idx - 1 if org_target_len < self.data_args.infty_gen_length else float('inf')
             targets.append(remaining)
-            masks.append(True if idx >= valid_start and idx <= seq_len - 1 and input_ids[idx] != self.tokenizer.eos_token_id else False)
+            masks.append(True if idx >= valid_start and idx <= org_target_len - 1 and input_ids[idx] != self.tokenizer.eos_token_id else False)
         return input_ids, targets, masks
 
     def preprocess_dataset(self, examples: dict[str, list[Any]]) -> dict[str, list[Any]]:
