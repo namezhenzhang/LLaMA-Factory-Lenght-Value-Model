@@ -137,6 +137,10 @@ class DataArguments:
         default=False,
         metadata={"help": "Whether or not to use a shared file system for the datasets."},
     )
+    infty_gen_length: int = field(
+        default=float('inf'),
+        metadata={"help": "The length of the generated sequence in infinite generation mode."},
+    )
 
     def __post_init__(self):
         def split_arg(arg):
