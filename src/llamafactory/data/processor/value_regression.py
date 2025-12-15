@@ -3,7 +3,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from ...extras import logging
 from ...extras.constants import IGNORE_INDEX
-from .processor_utils import DatasetProcessor, infer_seqlen
+from .processor_utils import DatasetProcessor
 
 
 if TYPE_CHECKING:
@@ -12,6 +12,14 @@ if TYPE_CHECKING:
 
 logger = logging.get_logger(__name__)
 
+def infer_seqlen(source_len: int, target_len: int, cutoff_len: int) -> tuple[int, int]:
+    r"""Compute the real sequence length after truncation by the cutoff_len."""
+    # Truncate target only: keep source as much as possible (up to cutoff),
+    # then shrink target to fit the remaining length budget.
+    new_source_len = min(source_len, cutoff_len)
+    max_target_len = max(cutoff_len - new_source_len, 0)
+    new_target_len = min(target_len, max_target_len)
+    return new_source_len, new_target_len
 
 class LengthValueDatasetProcessor(DatasetProcessor):
     def _encode_example(
@@ -33,7 +41,9 @@ class LengthValueDatasetProcessor(DatasetProcessor):
         prompt_ids, _ = self.template.mm_plugin.process_token_ids(
             prompt_ids, None, images, videos, audios, self.tokenizer, self.processor
         )
-        source_len, target_len = infer_seqlen(len(prompt_ids), len(response_ids), self.data_args.cutoff_len)
+        org_source_len, org_target_len = len(prompt_ids), len(response_ids)
+        org_max_len = org_source_len + org_target_len
+        source_len, target_len = infer_seqlen(org_source_len, org_target_len, self.data_args.cutoff_len)
         prompt_ids = prompt_ids[:source_len]
         response_ids = response_ids[:target_len]
 
@@ -43,21 +53,21 @@ class LengthValueDatasetProcessor(DatasetProcessor):
         targets: list[int] = []
         masks: list[bool] = []
 
-        valid_start = max(source_len - 1, 0)
+        valid_start = max(org_source_len - 1, 0)
         for idx in range(seq_len):
-            remaining = seq_len - idx
-            targets.append(int(remaining))
-            masks.append(True if idx >= valid_start and idx < seq_len - 1 else False) # ignore the last token <eos>
+            remaining = org_max_len - idx - 1 if org_target_len < self.data_args.infty_gen_length else float('inf')
+            targets.append(remaining)
+            masks.append(True if idx >= valid_start and idx <= seq_len - 1 and input_ids[idx] != self.tokenizer.eos_token_id else False)
         return input_ids, targets, masks
 
     def preprocess_dataset(self, examples: dict[str, list[Any]]) -> dict[str, list[Any]]:
         model_inputs = defaultdict(list)
         for i in range(len(examples["_prompt"])):
             if len(examples["_prompt"][i]) % 2 != 1 or len(examples["_response"][i]) != 1:
-                logger.warning_rank0(
-                    "Dropped invalid example: {}".format(examples["_prompt"][i] + examples["_response"][i])
-                )
-                continue
+                # logger.warning_rank0(
+                #     "Dropped invalid example: {}".format(examples["_prompt"][i] + examples["_response"][i])
+                # )
+                raise ValueError(f"Dropped invalid example because of odd number of prompt or response number != 1:\n{examples['_prompt'][i] + examples['_response'][i]}")
 
             input_ids, value_targets, value_mask = self._encode_example(
                 prompt=examples["_prompt"][i],
