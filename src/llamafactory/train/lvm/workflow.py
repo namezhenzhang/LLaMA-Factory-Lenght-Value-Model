@@ -44,6 +44,12 @@ def _enable_value_head_high_precision_mode(model: "torch.nn.Module", dtype: torc
 
     v_head = model.v_head
 
+    # Keep parameters in high precision from the start to avoid bf16 checkpoints
+    with torch.no_grad():
+        v_head.summary.weight.data = v_head.summary.weight.data.to(dtype)
+        if v_head.summary.bias is not None:
+            v_head.summary.bias.data = v_head.summary.bias.data.to(dtype)
+
     # Override forward to cast inputs and weights to float32 dynamically
     # This is necessary because DeepSpeed ZeRO-3 might cast weights back to bf16 during forward
     def forward_in_float32(self, input: torch.Tensor) -> torch.Tensor:
@@ -75,15 +81,17 @@ def run_lvm(
         raise ValueError("Value head not found in model")
 
     # Disable bias in value head
-    if hasattr(model, "v_head") and hasattr(model.v_head, "summary"):
-        if hasattr(model.v_head.summary, "bias") and model.v_head.summary.bias is not None:
-            model.v_head.summary.bias = None
+    # if hasattr(model, "v_head") and hasattr(model.v_head, "summary"):
+    #     if hasattr(model.v_head.summary, "bias") and model.v_head.summary.bias is not None:
+    #         model.v_head.summary.bias = None
 
     # Force value head (its linear layer) to run strictly in float32:
     #   - inputs to the linear layer are cast to float32
     #   - the linear transformation itself uses float32 weights
     #   - outputs from the linear layer stay in float32
     _enable_value_head_high_precision_mode(model, dtype=torch.float32)
+
+    print(model.v_head.summary.weight.dtype)
     
     data_collator = LengthValueDataCollator(
         template=template, model=model, pad_to_multiple_of=8, compute_dtype=model_args.compute_dtype, **tokenizer_module

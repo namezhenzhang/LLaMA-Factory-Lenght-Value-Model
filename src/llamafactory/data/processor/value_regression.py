@@ -14,8 +14,8 @@ logger = logging.get_logger(__name__)
 
 def infer_seqlen(source_len: int, target_len: int, cutoff_len: int) -> tuple[int, int]:
     r"""Compute the real sequence length after truncation by the cutoff_len."""
-    # Truncate target only: keep source as much as possible (up to cutoff),
-    # then shrink target to fit the remaining length budget.
+    # Keep source as much as possible (up to cutoff), then shrink target to fit
+    # the remaining length budget.
     new_source_len = min(source_len, cutoff_len)
     max_target_len = max(cutoff_len - new_source_len, 0)
     new_target_len = min(target_len, max_target_len)
@@ -38,6 +38,10 @@ class LengthValueDatasetProcessor(DatasetProcessor):
         if self.template.efficient_eos:
             response_ids += [self.tokenizer.eos_token_id]
 
+        # fix llamafactory bug: if the last token is \n, remove it
+        if response_ids[-1] == self.tokenizer.encode("\n")[0]:
+            response_ids = response_ids[:-1]
+
         prompt_ids, _ = self.template.mm_plugin.process_token_ids(
             prompt_ids, None, images, videos, audios, self.tokenizer, self.processor
         )
@@ -53,14 +57,25 @@ class LengthValueDatasetProcessor(DatasetProcessor):
         targets: list[int] = []
         masks: list[bool] = []
 
-        valid_start = max(org_source_len - 1, 0)
+        # valid positions: prompt final token + response tokens (within truncated window)
+        valid_start = max(source_len - 1, 0)
+        valid_end = source_len + target_len - 1  # inclusive
         for idx in range(seq_len):
             if idx < valid_start:
                 remaining = -1
             else:
-                remaining = org_max_len - idx - 1 if org_target_len < self.data_args.infty_gen_length else float('inf')
+                remaining = org_max_len - idx - 1 if org_target_len < self.data_args.infty_gen_length else float("inf")
+            assert remaining >= -1, f"remaining is {remaining} when idx is {idx}"
             targets.append(remaining)
-            masks.append(True if idx >= valid_start and idx <= org_target_len - 1 and input_ids[idx] != self.tokenizer.eos_token_id else False)
+            masks.append(
+                True
+                if (idx >= valid_start and idx <= valid_end and input_ids[idx] != self.tokenizer.eos_token_id)
+                else False
+            )
+
+        # accelerator = getattr(self, "accelerator", None)
+        # if accelerator is None or accelerator.is_main_process:
+        #     import pdb; pdb.set_trace()
         return input_ids, targets, masks
 
     def preprocess_dataset(self, examples: dict[str, list[Any]]) -> dict[str, list[Any]]:

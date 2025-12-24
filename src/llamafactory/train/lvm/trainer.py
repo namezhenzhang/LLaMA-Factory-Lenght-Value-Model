@@ -17,7 +17,7 @@
 
 from collections import OrderedDict
 from types import MethodType
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 import torch.nn.functional as F
@@ -38,6 +38,7 @@ if TYPE_CHECKING:
 
 logger = logging.get_logger(__name__)
 
+EPS = 1e-8
 
 class LengthValueTrainer(Trainer):
     r"""Trainer for length value regression."""
@@ -111,6 +112,17 @@ class LengthValueTrainer(Trainer):
 
         return value_preds
 
+    @staticmethod
+    def _value_to_length(v: torch.Tensor, gamma: float, eps: float = EPS) -> torch.Tensor:
+        r"""Convert discounted return value v in (-1, 0) to remaining length.
+
+        Paper: l = ln(1 + v) / ln(gamma).
+        """
+        gamma_t = torch.tensor(gamma, dtype=v.dtype, device=v.device)
+        denom = torch.log(gamma_t).clamp_max(-eps)  # ln(gamma) < 0, avoid divide-by-0 when gamma≈1
+        v_clamped = v.clamp(min=-1.0 + eps, max=0.0 - eps)  # keep 1+v in (0,1)
+        return torch.log1p(v_clamped) / denom
+
     # def _apply_decay_factor(self, value_labels: torch.Tensor, value_mask: torch.Tensor) -> torch.Tensor:
     #     r"""Apply decay factor to future token values.
         
@@ -143,36 +155,94 @@ class LengthValueTrainer(Trainer):
         
     #     return decayed_labels
 
-    def _compute_gae_advantage_return(self, y_hat: torch.Tensor, value_mask: torch.Tensor, reward: float, gamma: float, lam: float) -> torch.Tensor:
-        value_mask = value_mask.to(y_hat.dtype)
-        token_level_rewards = reward
-        nextvalues = 0
-        lastgaelam = 0
-        advantages_reversed = []
-        gen_len = y_hat.shape[-1]
+    def _compute_gae_advantage_return(
+        self,
+        y_hat: torch.Tensor,
+        value_mask: torch.Tensor,
+        value_labels: torch.Tensor,
+        reward: Union[float, torch.Tensor],
+        gamma: float,
+        lam: Union[float, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        r"""Compute token-level GAE advantages and λ-return targets.
 
-        for t in reversed(range(gen_len)):
-            delta = token_level_rewards + gamma * nextvalues - y_hat[:, t]
-            lastgaelam_ = delta + gamma * lam * lastgaelam
+        This implementation follows the paper:
+          δ_t = r_t + γ v_{t+1}^{old} - v_t^{old}
+          A_t = δ_t + γλ A_{t+1}
+          v_t^{tgt} = v_t^{old} + A_t
 
-            # skip values and TD-error on observation tokens
-            nextvalues = y_hat[:, t] * value_mask[:, t] + (1 - value_mask[:, t]) * nextvalues
-            lastgaelam = lastgaelam_ * value_mask[:, t] + (1 - value_mask[:, t]) * lastgaelam
+        Key detail for cutoff truncation:
+        - When the trajectory continues beyond the observed window (no token t+1 in the batch),
+          we bootstrap v_{t+1}^{old} using the deterministic Monte-Carlo return derived from
+          the ground-truth remaining length `value_labels` (see `value_regression.py`).
 
-            advantages_reversed.append(lastgaelam)
-        advantages = torch.stack(advantages_reversed[::-1], dim=1)
+        Notes:
+        - `value_mask` selects valid regression positions (prompt last token + response tokens, excluding EOS).
+        - `value_labels` is the remaining number of tokens to go until EOS for each position.
+        - `reward` is the per-step reward for non-EOS steps (often ±(1-γ) depending on sign convention).
+        """
+        dtype = y_hat.dtype
+        device = y_hat.device
 
-        returns = advantages + y_hat
+        # We only regress on mask=1 positions; everything else is ignored by the loss.
+        value_mask_f = value_mask.to(dtype)
+        remaining = value_labels.to(dtype)
 
-        # 简单版解码：
-        # - 整体左移一位：当前 token 的 return 等于下一个 token 的旧 return
-        # - 最后一位补 0
-        # - 再乘上 value_mask，保证只有 mask=1 的位置生效
-        shifted_returns = torch.zeros_like(returns)
-        shifted_returns[:, :-1] = returns[:, 1:]
-        returns = shifted_returns * value_mask
-        advantages = returns - y_hat
+        # stopgrad baseline
+        v_old = y_hat.detach()
 
+        lam_t = torch.as_tensor(lam, dtype=dtype, device=device)
+        reward_t = torch.as_tensor(reward, dtype=dtype, device=device)
+
+        # Deterministic MC return from remaining length:
+        # If reward = (1-γ)  => G_t =  (1 - γ^n)
+        # If reward = -(1-γ) => G_t = -(1 - γ^n)
+        # where n = remaining steps until EOS (i.e., `remaining`).
+        def mc_value_from_remaining(n: torch.Tensor) -> torch.Tensor:
+            if gamma == 1.0:
+                # Degenerate case; in practice gamma∈(0,1).
+                return torch.zeros_like(n)
+            gamma_t = torch.tensor(gamma, dtype=dtype, device=device)
+            # base ∈ [0, 1] (or [0,1) if finite)
+            base = 1.0 - torch.pow(gamma_t, n)
+            # scale is +1 or -1 depending on reward sign convention (reward should be ±(1-γ))
+            scale = 1 if reward_t / (1.0 - gamma_t) > 0 else -1
+            return scale * base
+
+        B, T = v_old.shape
+        advantages = torch.zeros((B, T), dtype=dtype, device=device)
+        lastgaelam = torch.zeros((B,), dtype=dtype, device=device)
+
+        for t in reversed(range(T)):
+            mask_t = value_mask_f[:, t]
+            if t < T - 1:
+                v_next_model = v_old[:, t + 1]
+                # If the next token is outside the observed window for this sequence
+                # (e.g., cutoff truncation or padding), bootstrap from deterministic MC value.
+                need_det = (remaining[:, t] > 1.0) & (value_mask_f[:, t + 1] == 0.0)
+                v_next_det = mc_value_from_remaining(torch.clamp(remaining[:, t] - 1.0, min=0.0))
+                v_next = torch.where(need_det, v_next_det, v_next_model)
+                # If the true next step is EOS (remaining==1), its value is deterministic 0.
+                v_next = torch.where(remaining[:, t] <= 1.0, torch.zeros_like(v_next), v_next)
+            else: # t == T - 1
+                # No t+1 token in the observed window. Bootstrap from the deterministic return
+                # of the next state using ground-truth remaining length.
+                # Next state's remaining length is (remaining-1).
+                v_next = torch.where(
+                    remaining[:, t] <= 1.0,
+                    torch.zeros((B,), dtype=dtype, device=device),
+                    mc_value_from_remaining(torch.clamp(remaining[:, t] - 1.0, min=0.0)),
+                )
+
+            delta = reward_t + gamma * v_next - v_old[:, t]
+            gae_t = delta + gamma * lam_t * lastgaelam
+
+            # Only update recursion and store values on valid positions.
+            # This also prevents leakage into padded/ignored tokens.
+            lastgaelam = gae_t * mask_t + lastgaelam * (1.0 - mask_t)
+            advantages[:, t] = lastgaelam
+
+        returns = v_old + advantages
         return advantages, returns
     def aggregate_loss(self, loss: torch.Tensor, value_mask: torch.Tensor, method: str = "token-mean") -> torch.Tensor:
         if method == "token-mean":
@@ -211,27 +281,32 @@ class LengthValueTrainer(Trainer):
     def compute_loss(
         self, model: "PreTrainedModel", inputs: dict[str, torch.Tensor], return_outputs: bool = False, **kwargs
     ):
+        # TODO: 看一下这里是不是需要把 value_labels 转换为 float64
         value_labels = inputs.pop("value_labels").to(torch.float64) # remaining number of tokens
         value_mask = inputs.pop("value_mask").to(torch.float64) # mask of response tokens
-        response_len = value_mask.sum(dim=-1)
+        # TODO: 这里 max 是不是对的
+        response_len = value_labels.max(dim=-1).values
 
+        # TODO: 这里_forward_value是不是太复杂了，需要写成一个函数吗？
         value_preds = self._forward_value(model, inputs).to(torch.float64)
 
         gamma = self.finetuning_args.lvm_gamma
+        lam = self.finetuning_args.lvm_lam
         if self.finetuning_args.lvm_alpha > 0:
             lam = 1 - 1/(self.finetuning_args.lvm_alpha * response_len)
             lam = torch.clamp(lam, min=0.0)
-        else:
-            lam = self.finetuning_args.lvm_lam
+
         delta = self.finetuning_args.lvm_huber_loss_delta
         agg_method = self.finetuning_args.lvm_agg_method
-        lvm_relative_loss = self.finetuning_args.lvm_relative_loss
-        reward = 1.0 - gamma
+        # Paper: r_t = -(1 - gamma) for all non-EOS steps (we do not regress on EOS itself).
+        reward = -(1.0 - gamma)
 
         y_hat = torch.sigmoid(value_preds)
+        # Paper: \hat v(s_t) = -sigma(W h_t) in (-1, 0).
+        y_hat = -y_hat
 
         with torch.no_grad():
-            advantages, returns = self._compute_gae_advantage_return(y_hat, value_mask, reward, gamma, lam)
+            advantages, returns = self._compute_gae_advantage_return(y_hat, value_mask, value_labels, reward, gamma, lam)
             # advantages = verl_F.masked_whiten(advantages, value_mask)
 
         value_loss = torch.nn.functional.huber_loss(
@@ -241,30 +316,35 @@ class LengthValueTrainer(Trainer):
 
         # Optionally convert to relative loss so that positions with
         # larger target values do not dominate the overall loss.
-        if lvm_relative_loss:
-            eps = 1e-8
-            value_loss = value_loss / (returns.abs() + eps)
+        if self.finetuning_args.lvm_relative_loss:
+            value_loss = value_loss / (returns.abs() + EPS)
 
         value_loss = self.aggregate_loss(value_loss, value_mask, method = agg_method)
 
         with torch.no_grad():
             # Compute and report losses for lam=0 and lam=1 (diagnostics only)
-            _, returns_lam0 = self._compute_gae_advantage_return(y_hat, value_mask, reward, gamma, 0.0)
+            _, returns_lam0 = self._compute_gae_advantage_return(y_hat, value_mask, value_labels, reward, gamma, 0.0)
             # loss_lam0 = F.huber_loss(y_hat, returns_lam0, reduction="none", delta=delta)
             loss_lam0 = 0.5 * (y_hat-returns_lam0) ** 2
             loss_lam0 = self.aggregate_loss(loss_lam0, value_mask, method = "seq-sum-token-sum")
             # relative loss: |y_hat - returns_lam0| / (|returns_lam0| + eps)
-            eps = 1e-8
-            rel_loss_lam0 = torch.abs(y_hat - returns_lam0) / (torch.abs(returns_lam0) + eps)
+            rel_loss_lam0 = torch.abs(y_hat - returns_lam0) / (torch.abs(returns_lam0) + EPS)
             rel_loss_lam0 = self.aggregate_loss(rel_loss_lam0, value_mask, method = "seq-sum-token-sum")
+            # Precompute length-space prediction once (used for lam=1 metric below).
+            len_pred = self._value_to_length(y_hat, gamma)
 
-            _, returns_lam1 = self._compute_gae_advantage_return(y_hat, value_mask, reward, gamma, 1.0)
+            
+
+            _, returns_lam1 = self._compute_gae_advantage_return(y_hat, value_mask, value_labels, reward, gamma, 1.0)
             # loss_lam1 = F.huber_loss(y_hat, returns_lam1, reduction="none", delta=delta)
             loss_lam1 = 0.5 * (y_hat-returns_lam1) ** 2
             loss_lam1 = self.aggregate_loss(loss_lam1, value_mask, method = "seq-sum-token-sum")
             # relative loss: |y_hat - returns_lam1| / (|returns_lam1| + eps)
-            rel_loss_lam1 = torch.abs(y_hat - returns_lam1) / (torch.abs(returns_lam1) + eps)
+            rel_loss_lam1 = torch.abs(y_hat - returns_lam1) / (torch.abs(returns_lam1) + EPS)
             rel_loss_lam1 = self.aggregate_loss(rel_loss_lam1, value_mask, method = "seq-sum-token-sum")
+            len_tgt_lam1 = self._value_to_length(returns_lam1, gamma)
+            rel_len_loss_lam1 = torch.abs(len_pred - len_tgt_lam1) / (torch.abs(len_tgt_lam1) + EPS)
+            rel_len_loss_lam1 = self.aggregate_loss(rel_len_loss_lam1, value_mask, method = "seq-sum-token-sum")
 
             # Accumulate diagnostics across micro-steps (gradient accumulation)
             # We store the *sum* of losses and the *sum* of valid tokens,
@@ -277,6 +357,8 @@ class LengthValueTrainer(Trainer):
             # accumulate relative losses
             self._diag_ga_sum_rel_lam0 += float(rel_loss_lam0.detach())
             self._diag_ga_sum_rel_lam1 += float(rel_loss_lam1.detach())
+            # accumulate length-space relative losses
+            self._diag_ga_sum_rel_len_lam1 = getattr(self, "_diag_ga_sum_rel_len_lam1", 0.0) + float(rel_len_loss_lam1.detach())
             self._diag_ga_count += batch_token_count
             self._diag_ga_step = (self._diag_ga_step + 1) % ga_steps
             # Only log once per optimizer step and in sync with logging_steps
@@ -290,7 +372,8 @@ class LengthValueTrainer(Trainer):
                     # sum_l05 = torch.tensor(self._diag_ga_sum_lam05, device=device, dtype=torch.float32)
                     sum_rel_l0 = torch.tensor(self._diag_ga_sum_rel_lam0, device=device, dtype=torch.float32)
                     sum_rel_l1 = torch.tensor(self._diag_ga_sum_rel_lam1, device=device, dtype=torch.float32)
-                    cnt = torch.tensor(self._diag_ga_count, device=device, dtype=torch.float32)  # total tokens
+                    sum_rel_len_l1 = torch.tensor(getattr(self, "_diag_ga_sum_rel_len_lam1", 0.0), device=device, dtype=torch.float32)
+                    cnt = torch.tensor(self._diag_ga_count, device=device)  # total tokens
                     if torch.distributed.is_available() and torch.distributed.is_initialized():
                         # torch.distributed.all_reduce(sum_main, op=torch.distributed.ReduceOp.SUM)
                         torch.distributed.all_reduce(sum_l0, op=torch.distributed.ReduceOp.SUM)
@@ -298,6 +381,7 @@ class LengthValueTrainer(Trainer):
                         torch.distributed.all_reduce(sum_l1, op=torch.distributed.ReduceOp.SUM)
                         torch.distributed.all_reduce(sum_rel_l0, op=torch.distributed.ReduceOp.SUM)
                         torch.distributed.all_reduce(sum_rel_l1, op=torch.distributed.ReduceOp.SUM)
+                        torch.distributed.all_reduce(sum_rel_len_l1, op=torch.distributed.ReduceOp.SUM)
                         torch.distributed.all_reduce(cnt, op=torch.distributed.ReduceOp.SUM)
 
                     if self.accelerator.is_main_process:
@@ -306,6 +390,7 @@ class LengthValueTrainer(Trainer):
                         avg_l1 = (sum_l1 / cnt.clamp_min(1.0)).item()
                         avg_rel_l0 = (sum_rel_l0 / cnt.clamp_min(1.0)).item()
                         avg_rel_l1 = (sum_rel_l1 / cnt.clamp_min(1.0)).item()
+                        avg_rel_len_l1 = (sum_rel_len_l1 / cnt.clamp_min(1.0)).item()
                         # print(f"value_loss(lam={lam}): {avg_main} | value_loss_lam0: {avg_l0} | value_loss_lam1: {avg_l1}")
                         self.log(
                             {
@@ -314,6 +399,7 @@ class LengthValueTrainer(Trainer):
                                 "train/value_loss_lam1": avg_l1,
                                 "train/value_rel_loss_lam0": avg_rel_l0,
                                 "train/value_rel_loss_lam1": avg_rel_l1,
+                                "train/len_rel_loss_lam1": avg_rel_len_l1,
                             }
                         )
                 # reset accumulators after optimizer step
@@ -322,6 +408,7 @@ class LengthValueTrainer(Trainer):
                 self._diag_ga_sum_lam1 = 0.0
                 self._diag_ga_sum_rel_lam0 = 0.0
                 self._diag_ga_sum_rel_lam1 = 0.0
+                self._diag_ga_sum_rel_len_lam1 = 0.0
                 self._diag_ga_count = 0
 
         if return_outputs:
@@ -364,7 +451,7 @@ class LengthValueTrainer(Trainer):
             y_hat = torch.sigmoid(value_preds)
 
             with torch.no_grad():
-                advantages, returns = self._compute_gae_advantage_return(y_hat, value_mask, reward, gamma, lam)
+                advantages, returns = self._compute_gae_advantage_return(y_hat, value_mask, value_labels, reward, gamma, lam)
                 # advantages = verl_F.masked_whiten(advantages, value_mask)
 
             value_loss = torch.nn.functional.huber_loss(
